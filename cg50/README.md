@@ -35,7 +35,14 @@ Needs the PrizmSDK at `C:\Users\salvador\PrizmSDK\PrizmSDK-win-0.6`
 make.bat
 ```
 
-`make.bat clean` removes the build output. `src/main.c` is the whole game;
+**macOS / Linux:** run `./tools/setup-toolchain.sh` once (needs Homebrew on macOS; builds the
+`sh3eb-elf` compiler, `mkg3a` and `libfxcg` into `~/prizm-toolchain`, ~30 min), then:
+
+```
+./make.sh
+```
+
+`make.bat clean` / `./make.sh clean` remove the build output. `src/main.c` is the whole game;
 `icon-uns.bmp` / `icon-sel.bmp` are the 92x64 menu icons.
 
 ## Differences from the HTML version

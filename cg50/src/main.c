@@ -15,6 +15,7 @@
 #include <fxcg/file.h>
 #include <fxcg/system.h>
 #include <string.h>
+#include <stddef.h>
 
 #ifndef KEY_PRGM_EXE
 #define KEY_PRGM_EXE 31      /* matrix code for EXE (not defined in this SDK version) */
@@ -242,29 +243,49 @@ static int saveBest(void) {
 /* ---------------------------------------------------------------- run save (main memory)
  * A run is saved whenever a menu/pause screen opens, so leaving to the
  * calculator's main menu (which may close the add-in) never loses it. */
-#define SAVE_MAGIC 0x53523031u
-typedef struct { u32 magic; int diff; State s; } SaveRec;
-static SaveRec SAVEBUF;
+#define SAVE_MAGIC 0x53523032u
+/* Compact record: magic, difficulty, State scalars (everything before objs),
+ * three counts, then only the live objects/bullets/zones. A mid-run save is a
+ * couple of KB instead of the whole ~9 KB State, which keeps main-memory writes fast. */
+#define SAVE_HEAD ((int)offsetof(State, objs))
+#define SAVE_FIXED (8 + SAVE_HEAD + 12)
+static unsigned char SAVEBUF[sizeof(State) + 32];
 static unsigned char SAVE_ITEM2[] = "GAME";
 static int hasSave, saveDist;
-static void clearSave(void) { MCSDelVar2(SAVE_DIR, SAVE_ITEM2); hasSave = 0; }
+static unsigned char *putb(unsigned char *p, const void *src, int n) { memcpy(p, src, n); return p + n; }
+static void clearSave(void) { if (hasSave) MCSDelVar2(SAVE_DIR, SAVE_ITEM2); hasSave = 0; }
 static void loadSave(void) {
     int len = 0;
     hasSave = 0;
-    if (MCSGetDlen2(SAVE_DIR, SAVE_ITEM2, &len) == 0 && len == (int)sizeof(SaveRec)) {
-        MCSGetData1(0, len, &SAVEBUF);
-        if (SAVEBUF.magic == SAVE_MAGIC && SAVEBUF.s.mode == M_PLAY && SAVEBUF.diff >= 0 && SAVEBUF.diff < 4) {
-            hasSave = 1; saveDist = (int)(SAVEBUF.s.dist / 10.0f);
+    if (MCSGetDlen2(SAVE_DIR, SAVE_ITEM2, &len) == 0 && len >= SAVE_FIXED && len <= (int)sizeof(SAVEBUF)) {
+        u32 magic; int d, mode, no, nb, nz; float dist;
+        unsigned char *h = SAVEBUF + 8;
+        MCSGetData1(0, len, SAVEBUF);
+        memcpy(&magic, SAVEBUF, 4); memcpy(&d, SAVEBUF + 4, 4);
+        memcpy(&mode, h + offsetof(State, mode), 4); memcpy(&dist, h + offsetof(State, dist), 4);
+        memcpy(&no, h + SAVE_HEAD, 4); memcpy(&nb, h + SAVE_HEAD + 4, 4); memcpy(&nz, h + SAVE_HEAD + 8, 4);
+        if (magic == SAVE_MAGIC && mode == M_PLAY && d >= 0 && d < 4 &&
+            no >= 0 && no <= MAX_OBJS && nb >= 0 && nb <= MAX_BULLETS && nz >= 0 && nz <= MAX_ZONES &&
+            len == SAVE_FIXED + no * (int)sizeof(Obj) + nb * (int)sizeof(Bullet) + nz * (int)sizeof(Zone)) {
+            hasSave = 1; saveDist = (int)(dist / 10.0f);
         }
     }
 }
 static void saveGame(void) {
     if (S.mode != M_PLAY) return;
-    SAVEBUF.magic = SAVE_MAGIC; SAVEBUF.diff = diff; SAVEBUF.s = S;
-    SAVEBUF.s.nfx = 0; SAVEBUF.s.ntexts = 0; SAVEBUF.s.shake = 0;
+    int sh = S.shake; S.shake = 0;
+    unsigned char *p = SAVEBUF;
+    u32 magic = SAVE_MAGIC;
+    p = putb(p, &magic, 4); p = putb(p, &diff, 4);
+    p = putb(p, &S, SAVE_HEAD);
+    p = putb(p, &S.nobjs, 4); p = putb(p, &S.nbullets, 4); p = putb(p, &S.nzones, 4);
+    p = putb(p, S.objs, S.nobjs * (int)sizeof(Obj));
+    p = putb(p, S.bullets, S.nbullets * (int)sizeof(Bullet));
+    p = putb(p, S.zones, S.nzones * (int)sizeof(Zone));
+    S.shake = sh;
     MCS_CreateDirectory(SAVE_DIR);
     MCSDelVar2(SAVE_DIR, SAVE_ITEM2);
-    MCSPutVar2(SAVE_DIR, SAVE_ITEM2, sizeof(SaveRec), &SAVEBUF);
+    MCSPutVar2(SAVE_DIR, SAVE_ITEM2, (int)(p - SAVEBUF), SAVEBUF);
     hasSave = 1; saveDist = (int)(S.dist / 10.0f);
 }
 
@@ -1091,7 +1112,7 @@ static int keyBit(const u16 *st, int code) {
 }
 static int keyDown(int code) { return keyBit(keyNow, code); }
 static int keyPressed(int code) { return keyBit(keyNow, code) && !keyBit(keyPrev, code); }
-static int anyKeyDown(void) { for (int i = 0; i < 8; i++) if (keyNow[i]) return 1; return 0; }
+static int anyKeyDown(void) { for (int i = 0; i < 5; i++) if (keyNow[i]) return 1; return 0; }   /* 10 rows x 8 cols = 5 words */
 
 /* Menus (title, pause, game over) are blocking OS GetKey loops: the OS then
  * handles MENU natively, so the calculator's main menu always works. The run
@@ -1102,8 +1123,12 @@ static void screenSetup(void) {
     EnableStatusArea(3);           /* hide the status bar: full 384x216 */
     vram = (u16 *)GetVRAMAddress();
 }
-static void flushKeys(void) {      /* wait until every key is released */
-    do keyUpdate(); while (anyKeyDown());
+static void flushKeys(void) {      /* wait briefly for keys to be released; never block forever */
+    int t0 = RTC_GetTicks(), dt, guard = 0;
+    do {
+        keyUpdate();
+        dt = RTC_GetTicks() - t0; if (dt < 0) dt = 64;
+    } while (anyKeyDown() && dt < 64 && ++guard < 20000);   /* time cap AND iteration cap */
     keyUpdate();
 }
 static int pauseScreen(void) {     /* returns 1 = resume, 0 = save and go to title */
@@ -1120,9 +1145,10 @@ static int pauseScreen(void) {     /* returns 1 = resume, 0 = save and go to tit
 }
 static int titleScreen(void) {     /* returns 1 = continue saved run, 0 = new game */
     int key;
-    flushKeys();
     loadSave();
     menuSel = 0;
+    draw(0); Bdisp_PutDisp_DD();   /* first frame goes up before anything that could wait */
+    flushKeys();
     for (;;) {
         draw(0); Bdisp_PutDisp_DD();
         GetKey(&key);
@@ -1146,9 +1172,17 @@ static int overScreen(void) {      /* returns 1 = retry, 0 = title */
         if (key == KEY_CTRL_EXIT) return 0;
     }
 }
-static void continueGame(void) {
-    diff = SAVEBUF.diff;
-    S = SAVEBUF.s;
+static void continueGame(void) {          /* unpack the record validated by loadSave() */
+    unsigned char *p = SAVEBUF + 4;
+    int no, nb, nz;
+    memcpy(&diff, p, 4); p += 4;
+    memset(&S, 0, sizeof(S));
+    memcpy(&S, p, SAVE_HEAD); p += SAVE_HEAD;
+    memcpy(&no, p, 4); memcpy(&nb, p + 4, 4); memcpy(&nz, p + 8, 4); p += 12;
+    memcpy(S.objs, p, no * sizeof(Obj)); p += no * sizeof(Obj);
+    memcpy(S.bullets, p, nb * sizeof(Bullet)); p += nb * sizeof(Bullet);
+    memcpy(S.zones, p, nz * sizeof(Zone));
+    S.nobjs = no; S.nbullets = nb; S.nzones = nz;
     S.mode = M_PLAY; S.saved = 0; S.shake = 0;
     seed = (u32)RTC_GetTicks() * 2654435761u | 1u;
 }
@@ -1164,7 +1198,6 @@ int main(void) {
         FORM_ORDER[j + 1] = t;
     }
     loadBest();
-    loadSave();
     newGame(0);
 
     int last = RTC_GetTicks(), acc = 0;
