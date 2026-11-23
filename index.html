@@ -1,0 +1,1153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Squad Rush</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0d1620; overflow: hidden; touch-action: none; }
+  body { display: flex; align-items: center; justify-content: center; flex-direction: column; font-family: system-ui, sans-serif; color: #8aa; }
+  canvas { border-radius: 6px; box-shadow: 0 10px 40px #000; display: block; }
+  #bar { margin-top: 12px; display: flex; gap: 16px; align-items: center; justify-content: center; flex-wrap: wrap; font-size: 13px; }
+  #bar button { white-space: nowrap; }
+  #help { width: 100%; text-align: center; font-size: 12px; }
+  button { font: bold 14px system-ui, sans-serif; color: #fff; background: #2f6fe0; border: 0; border-radius: 8px; padding: 8px 16px; cursor: pointer; box-shadow: 0 3px 0 #1a428f; }
+  button:active { transform: translateY(2px); box-shadow: 0 1px 0 #1a428f; }
+  #diffs { display: flex; gap: 4px; }
+  #view { background: #5a4ab0; box-shadow: 0 3px 0 #352a75; }
+  body.cg canvas { image-rendering: pixelated; border-radius: 2px; margin-bottom: 18px;
+    box-shadow: 0 0 0 10px #101216, 0 0 0 22px #2a2e36, 0 0 0 24px #3a3f49, 0 24px 60px #000; }
+  #diffs button { background: #2a3a4a; box-shadow: 0 3px 0 #18222c; padding: 8px 11px; color: #9ab; }
+  #diffs button.on { background: #e8f0f8; color: #123; box-shadow: 0 3px 0 #8a9aa8; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="bar">
+  <button id="reset" title="Restart (R)">&#x21bb; Reset</button>
+  <button id="view" title="Switch between the full-quality and calculator-style renderers"></button>
+  <div id="diffs"><button>Easy</button><button>Normal</button><button>Hard</button><button>Insane</button></div>
+  <span id="help">Move: &larr; &rarr; / A D / drag &nbsp;·&nbsp; Start: Enter / tap &nbsp;·&nbsp; Pause: P &nbsp;·&nbsp; FPS: F &nbsp;·&nbsp; Reset: R</span>
+</div>
+<script>
+"use strict";
+// ---------------------------------------------------------------------------
+// Squad Rush — original game. Logical screen is 396x224 (the fx-CG50's
+// resolution) and the simulation runs at a fixed 30 ticks/second so it can be
+// ported to the calculator. The "3D" is a simple software perspective
+// projection: no WebGL, just scaled shapes drawn back-to-front.
+// ---------------------------------------------------------------------------
+const W = 396, H = 224;
+const ROAD = 50;                 // road half-width (world units)
+const PZ = 10;                   // player squad depth
+const FAR = 440;                 // spawn depth
+const CAMD = 50, CAMH = 64, F = 136, HOR = 8;   // camera
+const MAX_DRAWN = 60, MAX_BULLETS = 80, MAX_N = 1e15;   // squad cap: effectively unlimited
+const BOSS_STOP = PZ + 16;       // the boss plants himself here and blocks the road
+
+// ---- difficulty -------------------------------------------------------------
+// enemy: enemy group size multiplier   twoGood: % chance both gates are good
+// boss: boss HP multiplier             speed: scroll speed multiplier
+// crate: crate-collision damage mult   bad: bad-gate strength multiplier
+const DIFFS = [
+  { name: "EASY",   col: "#3fd27a", enemy: 1.0, twoGood: 25, boss: 1.0, speed: 1.00, crate: 1, bad: 1.0, start: 5 },
+  { name: "NORMAL", col: "#3fb0ff", enemy: 1.6, twoGood: 12, boss: 1.7, speed: 1.12, crate: 2, bad: 1.4, start: 8 },
+  { name: "HARD",   col: "#ff9a2e", enemy: 2.4, twoGood: 5,  boss: 2.6, speed: 1.25, crate: 3, bad: 1.9, start: 12 },
+  { name: "INSANE", col: "#ff3b3b", enemy: 3.5, twoGood: 0,  boss: 4.0, speed: 1.40, crate: 5, bad: 2.6, start: 18 },
+];
+let diff = Math.min(DIFFS.length - 1, +(localStorage.getItem("squadrush.diff") || 0));
+function D() { return DIFFS[diff]; }
+function setDiff(i) {
+  diff = (i + DIFFS.length) % DIFFS.length;
+  localStorage.setItem("squadrush.diff", diff);
+  document.querySelectorAll("#diffs button").forEach((b, j) => b.classList.toggle("on", j === diff));
+}
+
+// 1234 -> "1234", 12345 -> "12.3K", ... so huge squads still fit on screen
+function fmt(n) {
+  n = Math.floor(n);
+  if (n < 10000) return String(n);
+  const u = ["K", "M", "B", "T", "Q"];
+  let i = -1;
+  while (n >= 1000 && i < u.length - 1) { n /= 1000; i++; }
+  return (n < 100 ? n.toFixed(1) : Math.floor(n)) + u[i];
+}
+const TICK = 1000 / 30;
+const FS = 0.55;                 // formation spread (world units per table unit)
+
+const cv = document.getElementById("c");
+// ?cg50 in the URL switches to the calculator-style preview renderer
+const CG = new URLSearchParams(location.search).has("cg50");
+if (CG) document.body.classList.add("cg");
+const g = cv.getContext("2d", { alpha: false });
+let CG_IMG = null, CG_U32 = null;
+let K = 1;                       // backing-store pixels per logical pixel
+function fit() {
+  if (CG) {   // calculator preview: native 396x224, integer upscale, hard pixels
+    const k = Math.max(1, Math.floor(Math.min((innerWidth - 60) / W, (innerHeight - 150) / H)));
+    cv.style.width = W * k + "px"; cv.style.height = H * k + "px";
+    K = 1; cv.width = W; cv.height = H; GRAD = null; CG_IMG = null;
+    return;
+  }
+  const s = Math.max(1, Math.min((innerWidth - 24) / W, (innerHeight - 110) / H));
+  cv.style.width = W * s + "px"; cv.style.height = H * s + "px";
+  // cap the backing store: beyond ~2.5x the extra pixels cost fill-rate but look the same
+  K = Math.min(2.5, s * (devicePixelRatio || 1));
+  SPRITES.clear(); GRAD = null;
+  cv.width = Math.round(W * K); cv.height = Math.round(H * K);
+}
+const SPRITES = new Map();
+let GRAD = null;
+addEventListener("resize", fit); fit();
+
+// ---- colours --------------------------------------------------------------
+const C = {
+  sky: "#bfe6f5", water: "#2f86b8", waterFar: "#6fb4d6", wave: "#7cc4e8",
+  road: "#cbbdbb", roadEdge: "#b3a4a3", dash: "#ffffff",
+  wallTop: "#bdbdbd", wallIn: "#8e8e8e", wallFront: "#a5a5a5", pillarTop: "#9a9a9a", pillarFront: "#7b7b7b",
+  me: "#2f7bf0", meDark: "#1a4fb0", meLight: "#7fb2ff",
+  foe: "#e8343a", foeDark: "#9c1c22", foeLight: "#ff8a8a",
+  good: "#2f8cff", goodEdge: "#bfe0ff", bad: "#ff3b3b", badEdge: "#ffc4c4", post: "#55606a",
+  crate: "#d4883c", crateTop: "#e9a65e", crateDark: "#8a5020",
+  bullet: "#7fd8ff", gold: "#ffd23a", text: "#ffffff",
+};
+
+// ---- RNG (xorshift32, reproducible in C) ----------------------------------
+let seed = 12345;
+function rnd() { seed ^= seed << 13; seed >>>= 0; seed ^= seed >>> 17; seed ^= seed << 5; seed >>>= 0; return seed; }
+function rint(a, b) { return a + (rnd() % (b - a + 1)); }
+function hash(i) { i = Math.imul(i ^ 0x9e3779b9, 0x85ebca6b); i ^= i >>> 13; i = Math.imul(i, 0xc2b2ae35); return (i ^ (i >>> 16)) >>> 0; }
+
+// ---- formation tables (identical to the calculator port) ------------------
+const FORM = [[0,0],[-2,2],[0,-4],[3,4],[-6,-1],[6,-3],[-2,6],[-4,-6],[9,2],[-9,3],[4,-7],[3,8],[-10,-4],[11,-2],[-7,8],[-2,-10],[10,7],[-13,0],[10,-8],[-1,11],[-9,-9],[15,2],[-12,7],[3,-12],[8,11],[-15,-4],[15,-5],[-6,12],[-6,-13],[15,6],[-17,4],[10,-12],[3,14],[-15,-9],[19,-1],[-13,11],[0,-15],[13,12],[-20,-1],[16,-10],[-4,16],[-11,-14],[20,4],[-19,8],[7,-16],[8,16],[-20,-7],[21,-5],[-11,15],[-5,-18],[18,10],[-23,2],[15,-14],[1,19],[-17,-13],[24,1],[-18,12],[3,-19],[14,16],[-24,-4]];
+const RAD = [7,7,9,10,10,11,12,12,13,14,14,15,15,16,16,16,17,17,18,18,18,19,19,19,20,20,20,21,21,21,22,22,22,22,23,23,23,23,24,24,24,24,25,25,25,25,26,26,26,26,27,27,27,27,28,28,28,28,28,29,29];
+function radius(n) { return RAD[Math.min(Math.max(n, 0), MAX_DRAWN)] * FS; }
+
+// ---- projection -----------------------------------------------------------
+function sc(z) { return F / Math.max(4, z + CAMD); }
+function sx(x, s) { return W / 2 + x * s; }
+function sy(y, s) { return HOR + (CAMH - y) * s; }
+function quad(pts, col) {               // pts: [[x,y,z],...]
+  g.fillStyle = col; g.beginPath();
+  pts.forEach(([x, y, z], i) => { const s = sc(z); i ? g.lineTo(sx(x, s), sy(y, s)) : g.moveTo(sx(x, s), sy(y, s)); });
+  g.closePath(); g.fill();
+}
+
+// ---- input ----------------------------------------------------------------
+const keys = {};
+let pointerX = null, tapped = false;
+addEventListener("keydown", e => {
+  keys[e.code] = true;
+  if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Space"].includes(e.code)) e.preventDefault();
+  if (e.code === "Enter" || e.code === "Space") tapped = true;
+  if (e.code === "KeyP" && state.mode === "play") state.paused = !state.paused;
+  if (e.code === "KeyR") newGame();
+  if (e.code === "KeyF") showFps = !showFps;
+  if (state.mode === "title" && (e.code === "ArrowUp" || e.code === "ArrowDown" || e.code === "ArrowLeft" || e.code === "ArrowRight"))
+    setDiff(diff + (e.code === "ArrowUp" || e.code === "ArrowLeft" ? -1 : 1)), best = loadBest();
+});
+addEventListener("keyup", e => { keys[e.code] = false; });
+function toWorldX(ev) {
+  const r = cv.getBoundingClientRect();
+  return ((ev.clientX - r.left) * W / r.width - W / 2) / sc(PZ);
+}
+cv.addEventListener("pointerdown", e => { pointerX = toWorldX(e); tapped = true; cv.setPointerCapture(e.pointerId); });
+cv.addEventListener("pointermove", e => { if (pointerX !== null) pointerX = toWorldX(e); });
+cv.addEventListener("pointerup", () => { pointerX = null; });
+const viewBtn = document.getElementById("view");
+viewBtn.textContent = CG ? "HD view" : "CG50 view";
+viewBtn.addEventListener("click", () => { location.search = CG ? "" : "?cg50"; });
+document.getElementById("reset").addEventListener("click", e => { e.currentTarget.blur(); newGame(); });
+document.querySelectorAll("#diffs button").forEach((b, i) => b.addEventListener("click", () => {
+  b.blur(); saveBest(); setDiff(i); newGame(); state.mode = "title";
+}));
+
+// ---- state ----------------------------------------------------------------
+// best distance is stored per difficulty
+function loadBest() { return +(localStorage.getItem("squadrush.best." + diff) || 0); }
+let best = 0;
+let state;
+// Records the current run's distance as the best if it beat it. Called on game
+// over AND on reset, so restarting mid-run never throws a record away.
+function saveBest() {
+  if (!state || state.mode === "title" || state.saved) return false;
+  state.saved = true;
+  const m = Math.floor(state.dist / 10);
+  best = loadBest();
+  if (m > best) { best = m; localStorage.setItem("squadrush.best." + diff, best); return true; }
+  return false;
+}
+function newGame() {
+  saveBest();
+  best = loadBest();
+  seed = (Date.now() & 0x7fffffff) | 1;
+  state = {
+    mode: "play", paused: false, t: 0, overT: 0,
+    px: 0, n: D().start, dist: 0, v: 2.4, fireAcc: 0,
+    nextSpawn: 120, lastBoss: 0, nextBoss: 3600, bossAlive: false, kills: 0, newBest: false,
+    bullets: [], objs: [], fx: [], texts: [], shake: 0,
+  };
+}
+setDiff(diff);
+newGame(); state.mode = "title";
+function level() { return Math.floor(state.dist / 2000); }
+
+function popText(x, y, z, txt, col) { state.texts.push({ x, y, z, txt, col, t: 32 }); }
+function burst(x, y, z, col, k) {
+  for (let i = 0; i < k && state.fx.length < 80; i++)
+    state.fx.push({ x, y, z, vx: (rint(0, 40) - 20) / 20, vy: rint(5, 25) / 10, vz: (rint(0, 40) - 20) / 20, t: rint(8, 16), col });
+}
+
+// ---- spawning ---------------------------------------------------------------
+function goodOp(lv) {
+  const r = rint(0, 99);
+  if (r < 55) return { k: "add", v: rint(3, 8) + lv * 3, hits: 0 };
+  if (r < 80) return { k: "mul", v: 2 };
+  if (r < 90) return { k: "mul", v: 3 };
+  if (r < 97 || state.n < 20) return { k: "pow", v: 2 };   // squad squared
+  return { k: "pow", v: 3 };                                // squad cubed (rare)
+}
+function badOp(lv) {
+  const r = rint(0, 9), d = D();
+  // bad gates also scale with the squad so a huge army can still be hurt
+  if (r < 6) return { k: "add", v: -Math.round((rint(2, 6) + lv * 3) * d.bad + state.n * 0.05 * d.bad), hits: 0 };
+  if (r < 9 - Math.round(d.bad - 1)) return { k: "div", v: 2 };
+  if (d.bad >= 1.4 && rnd() % 3 === 0) return { k: "root", v: 2 };   // square root
+  if (d.bad >= 2.5) return { k: "div", v: 3 };
+  return { k: "add", v: rint(1, 3), hits: 0 };
+}
+function spawnGates(z) {
+  const lv = level();
+  let a = goodOp(lv), b = rint(0, 99) < D().twoGood ? goodOp(lv) : badOp(lv);
+  if (rnd() & 1) [a, b] = [b, a];
+  state.objs.push({ type: "gate", z, ops: [a, b], used: false });
+}
+function spawnEnemies(z) {
+  const lv = level(), groups = rint(0, 2) === 0 ? 2 : 1;
+  for (let i = 0; i < groups; i++) {
+    const n = Math.min(MAX_N, Math.round((rint(3, 6) + lv * rint(3, 6) + state.n / rint(3, 6)) * D().enemy));
+    const x = groups === 2 ? (i ? 25 : -25) : rint(-30, 30);
+    state.objs.push({ type: "enemy", x, z: z + i * 12, n, hold: 0 });
+  }
+}
+function spawnCrate(z) {
+  const lv = level(), hp = Math.round((rint(8, 16) + lv * 8) * (0.7 + 0.3 * D().crate));
+  state.objs.push({ type: "crate", x: rint(-36, 36), z, hp, reward: Math.max(3, Math.floor(hp / 3)) });
+}
+function spawnBoss() {
+  const hp = Math.round((120 + level() * 90 + state.n * 0.4) * D().boss);
+  state.objs.push({ type: "boss", x: 0, z: FAR, hp, max: hp, dir: 1, planted: false, swing: 0 });
+  state.bossAlive = true;
+  popText(0, 30, 150, "BOSS!", C.bad);
+}
+function spawnPattern() {
+  const r = rint(0, 99);
+  if (r < 38) { spawnGates(FAR); state.nextSpawn += 200; }
+  else if (r < 68) { spawnEnemies(FAR); state.nextSpawn += 170; }
+  else if (r < 82) { spawnCrate(FAR); state.nextSpawn += 140; }
+  else { spawnGates(FAR); spawnEnemies(FAR + 120); state.nextSpawn += 290; }
+}
+
+// ---- gate helpers ------------------------------------------------------------
+function opLabel(op) {
+  if (op.k === "add") return (op.v >= 0 ? "+" : "") + op.v;
+  if (op.k === "pow") return "x" + (op.v === 2 ? "²" : "³");
+  if (op.k === "root") return "√x";
+  return (op.k === "mul" ? "×" : "÷") + op.v;
+}
+function opGood(op) { return op.k === "mul" || op.k === "pow" || (op.k === "add" && op.v > 0); }
+function applyOp(op, n) {
+  let r;
+  if (op.k === "add") r = n + op.v;
+  else if (op.k === "mul") r = n * op.v;
+  else if (op.k === "pow") r = Math.pow(n, op.v);
+  else if (op.k === "root") r = Math.sqrt(n);
+  else r = n / op.v;
+  return Math.max(0, Math.min(MAX_N, Math.floor(r)));
+}
+
+const OP_ORDER = { add: 0, root: 1, div: 2, mul: 3, pow: 4 };
+// True when the squad is centred enough to pass through both gates at once.
+function straddling() { return Math.abs(state.px) < Math.max(2.5, radius(state.n) * 0.55); }
+
+// ---- update -------------------------------------------------------------------
+// remove dead entries in place (no new arrays each tick -> less GC stutter)
+function compact(a, alive) {
+  let j = 0;
+  for (let i = 0; i < a.length; i++) if (alive(a[i])) a[j++] = a[i];
+  a.length = j;
+}
+const notDead = o => !o.dead;
+function update() {
+  const s = state;
+  s.t++;
+  if (s.mode !== "play" || s.paused) return;
+
+  let dir = 0;
+  if (keys.ArrowLeft || keys.KeyA) dir--;
+  if (keys.ArrowRight || keys.KeyD) dir++;
+  if (dir) s.px += dir * 2.6;
+  else if (pointerX !== null) s.px += Math.max(-3, Math.min(3, pointerX - s.px));
+  const pr = radius(s.n);
+  s.px = Math.max(-ROAD + pr, Math.min(ROAD - pr, s.px));
+
+  s.v = Math.min(3.4, 1.6 + s.dist / 6000) * D().speed;
+  const boss = s.objs.find(o => o.type === "boss");
+  // the world stops scrolling once the boss has planted himself in the road
+  const v = boss ? (boss.planted ? 0 : s.v * 0.3) : s.v;
+  s.dist += v;
+  if (!s.bossAlive) {
+    if (s.dist >= s.nextBoss) { spawnBoss(); s.lastBoss = s.nextBoss; s.nextBoss += 4400; s.nextSpawn = s.dist + 320; }
+    else if (s.dist >= s.nextSpawn) spawnPattern();
+  }
+
+  // fire
+  s.fireAcc += Math.min(0.3 + s.n * 0.045, 4);
+  while (s.fireAcc >= 1) {
+    s.fireAcc -= 1;
+    if (s.bullets.length < MAX_BULLETS) {
+      const f = FORM[rint(0, Math.min(s.n, MAX_DRAWN) - 1)];
+      const bz = PZ + f[1] * FS;
+      s.bullets.push({ x: s.px + f[0] * FS, z: bz, pz: bz, d: Math.max(1, Math.floor(s.n / 150)) });
+    }
+  }
+  for (const b of s.bullets) { b.pz = b.z; b.z += 9; }
+
+  // move objects
+  for (const o of s.objs) {
+    if (o.type === "gate" || o.type === "crate") o.z -= v;
+    else if (o.type === "enemy") {
+      if (o.hold > 0) o.hold--;
+      else {
+        o.z -= v + 1.0;
+        if (o.z < 300) o.x += Math.sign(s.px - o.x) * Math.min(0.5, Math.abs(s.px - o.x));
+      }
+      const er = radius(o.n);
+      o.x = Math.max(-ROAD + er, Math.min(ROAD - er, o.x));
+    } else if (o.type === "boss") {
+      if (!o.planted) {
+        o.z -= o.z > 180 ? 1.4 : 0.5;
+        o.x += o.dir * 0.5;
+        if (o.x < -25 || o.x > 25) o.dir = -o.dir;
+        if (o.z <= BOSS_STOP) { o.z = BOSS_STOP; o.planted = true; s.shake = 8; }
+      } else {
+        // planted: step toward the squad so he can't be dodged
+        o.x += Math.sign(s.px - o.x) * Math.min(0.8, Math.abs(s.px - o.x));
+      }
+      o.swing++;
+    }
+  }
+
+  // bullets vs objects (swept along z)
+  for (const b of s.bullets) {
+    if (b.z > FAR + 20) { b.dead = true; continue; }
+    for (const o of s.objs) {
+      if (o.dead) continue;
+      if (o.type === "gate") {
+        if (o.used || !(b.pz <= o.z && b.z >= o.z)) continue;
+        const op = o.ops[b.x < 0 ? 0 : 1];
+        b.dead = true;
+        if (op.k === "add" && ++op.hits >= 4) { op.hits = 0; op.v++; }
+        break;
+      }
+      let hx, hz;
+      if (o.type === "enemy") hx = hz = radius(o.n);
+      else if (o.type === "crate") { hx = 8; hz = 6; }
+      else { hx = 14; hz = 6; }
+      if (Math.abs(b.x - o.x) >= hx || b.z < o.z - hz || b.pz > o.z + hz) continue;
+      b.dead = true;
+      if (o.type === "enemy") {
+        const k = Math.min(b.d, o.n); o.n -= k; s.kills += k;
+        burst(b.x, 3, o.z - hz, C.foe, 2);
+        if (o.n <= 0) { o.dead = true; burst(o.x, 3, o.z, C.foe, 10); }
+      } else if (o.type === "crate") {
+        if ((o.hp -= b.d) <= 0) {
+          o.dead = true; s.n += o.reward;
+          popText(o.x, 16, o.z, "+" + fmt(o.reward), C.gold); burst(o.x, 6, o.z, C.crate, 14);
+        }
+      } else {
+        if ((o.hp -= b.d) <= 0) bossDown(o);
+        else if ((o.hp & 7) === 0) burst(b.x, 10, o.z - hz, C.foe, 1);
+      }
+      break;
+    }
+  }
+  compact(s.bullets, notDead);
+
+  // objects vs squad
+  for (const o of s.objs) {
+    if (o.dead) continue;
+    if (o.type === "gate") {
+      if (!o.used && o.z <= PZ) {
+        o.used = true;
+        const before = s.n;
+        let ops;
+        if (straddling()) {
+          // squad covers the centre line: it runs through BOTH gates.
+          // Additions/subtractions are applied first, then the multipliers.
+          ops = o.ops.slice().sort((a, b) => OP_ORDER[a.k] - OP_ORDER[b.k]);
+          popText(s.px, 24, PZ, "BOTH!", "#7fffd4");
+        } else ops = [o.ops[s.px < 0 ? 0 : 1]];
+        for (const op of ops) s.n = applyOp(op, s.n);
+        popText(s.px, 14, PZ, (s.n >= before ? "+" : "-") + fmt(Math.abs(s.n - before)), s.n >= before ? C.gold : C.bad);
+      }
+      if (o.z < -30) o.dead = true;
+    } else if (o.type === "enemy") {
+      const r = radius(o.n) + radius(s.n) - 2;
+      if (Math.abs(o.x - s.px) < r && Math.abs(o.z - PZ) < r) {
+        const d = Math.min(Math.max(1, Math.ceil(Math.min(o.n, s.n) / 10)), o.n, s.n);
+        o.n -= d; s.n -= d; o.hold = 2; s.shake = 3;
+        burst((o.x + s.px) / 2, 3, (o.z + PZ) / 2, C.foe, 2);
+        if (o.n <= 0) o.dead = true;
+      }
+      if (o.z < -30) o.dead = true;
+    } else if (o.type === "crate") {
+      if (Math.abs(o.x - s.px) < 8 + radius(s.n) && Math.abs(o.z - PZ) < 8) {
+        const d = Math.min(s.n, Math.round((2 + level() * 2) * D().crate + s.n * 0.03 * D().crate));
+        s.n -= d; o.dead = true; s.shake = 6;
+        popText(s.px, 14, PZ, "-" + fmt(d), C.bad); burst(o.x, 6, o.z, C.crate, 14);
+      }
+      if (o.z < -30) o.dead = true;
+    } else if (o.type === "boss") {
+      // once planted he smashes the squad every few ticks until one side is dead
+      if (o.planted && o.swing % 8 === 0) {
+        const d = Math.min(s.n, Math.max(2, Math.ceil(s.n * 0.018 * D().boss)));
+        const back = Math.min(o.hp, d);
+        s.n -= d; o.hp -= back; s.shake = 5;
+        burst(s.px, 4, PZ + 4, C.me, 4);
+        popText(s.px, 12, PZ + 4, "-" + fmt(d), C.bad);
+        if (o.hp <= 0) bossDown(o);
+      }
+    }
+  }
+  compact(s.objs, notDead);
+
+  for (const p of s.fx) { p.x += p.vx; p.y += p.vy; p.z += p.vz; p.vy -= 0.35; p.t--; }
+  compact(s.fx, p => p.t > 0 && p.y > -2);
+  for (const t of s.texts) { t.y += 0.6; t.t--; }
+  compact(s.texts, t => t.t > 0);
+  if (s.shake > 0) s.shake--;
+  if (s.n > MAX_N) s.n = MAX_N;
+
+  if (s.n <= 0) {
+    s.n = 0; s.mode = "over"; s.overT = 0;
+    s.newBest = saveBest();
+  }
+}
+function bossDown(o) {
+  const s = state;
+  o.dead = true; s.bossAlive = false; const bonus = 25 + level() * 25; s.n += bonus; s.shake = 10;
+  popText(o.x, 30, o.z, "BOSS DOWN +" + bonus, C.gold); burst(o.x, 10, o.z, C.foe, 30);
+}
+
+// ---- drawing: environment --------------------------------------------------
+function drawWorld() {
+  const s = state, d = s.dist;
+  // sky + sea
+  g.fillStyle = C.sky; g.fillRect(0, 0, W, HOR + 2);
+  g.fillStyle = grads().sea; g.fillRect(0, HOR, W, H - HOR);
+  // waves
+  g.fillStyle = C.wave; g.globalAlpha = 0.7;
+  const base = Math.floor(d / 16);
+  for (let k = 0; k < 30; k++) {
+    const z = k * 16 - (d % 16), row = base + k;
+    if (z < -12) continue;
+    const s0 = sc(z);
+    for (let j = 0; j < 3; j++) {
+      const h = hash(row * 7 + j);
+      const x = 66 + (h % 160), side = (h >> 9) & 1 ? 1 : -1;
+      const wx = sx(side * x, s0), wy = sy(-14, s0);
+      g.fillRect(wx - 3 * s0, wy, 6 * s0, Math.max(0.6, 0.8 * s0));
+    }
+  }
+  g.globalAlpha = 1;
+
+  const ZN = -14, ZF = FAR + 60;
+  // pillars sticking out under the bridge (far to near)
+  const pStep = 48;
+  for (let k = Math.ceil((ZF + d) / pStep); k * pStep - d > ZN - 20; k--) {
+    const z = k * pStep - d;
+    for (const side of [-1, 1]) {
+      const xi = side * 55, xo = side * 66;
+      quad([[xi, 2, z + 14], [xo, 2, z + 14], [xo, 2, z], [xi, 2, z]], C.pillarTop);
+      quad([[xi, 2, z], [xo, 2, z], [xo, -14, z], [xi, -14, z]], C.pillarFront);
+    }
+  }
+  // road deck
+  quad([[-ROAD, 0, ZF], [ROAD, 0, ZF], [ROAD, 0, ZN], [-ROAD, 0, ZN]], C.road);
+  quad([[-ROAD, 0, ZF], [-ROAD + 5, 0, ZF], [-ROAD + 5, 0, ZN], [-ROAD, 0, ZN]], C.roadEdge);
+  quad([[ROAD - 5, 0, ZF], [ROAD, 0, ZF], [ROAD, 0, ZN], [ROAD - 5, 0, ZN]], C.roadEdge);
+  // center dashes
+  for (let z = ZF - ((ZF + d) % 30); z > ZN - 30; z -= 30)
+    quad([[-0.8, 0, z + 12], [0.8, 0, z + 12], [0.8, 0, z], [-0.8, 0, z]], C.dash);
+  // parapet walls
+  for (const side of [-1, 1]) {
+    const xi = side * ROAD, xo = side * 55;
+    quad([[xi, 0, ZF], [xi, 4, ZF], [xi, 4, ZN], [xi, 0, ZN]], C.wallIn);
+    quad([[xi, 4, ZF], [xo, 4, ZF], [xo, 4, ZN], [xi, 4, ZN]], C.wallTop);
+  }
+  // crenellation blocks on the walls
+  const bStep = 24;
+  for (let k = Math.ceil((ZF + d) / bStep); k * bStep - d > ZN - 12; k--) {
+    const z = k * bStep - d;
+    for (const side of [-1, 1]) {
+      const xi = side * (ROAD + 0.5), xo = side * 55;
+      quad([[xi, 4, z + 10], [xi, 8, z + 10], [xi, 8, z], [xi, 4, z]], C.wallIn);
+      quad([[xi, 8, z + 10], [xo, 8, z + 10], [xo, 8, z], [xi, 8, z]], C.wallTop);
+      quad([[xi, 8, z], [xo, 8, z], [xo, 4, z], [xi, 4, z]], C.wallFront);
+    }
+  }
+}
+
+// ---- drawing: objects ---------------------------------------------------------
+function shadow(x, z, rx) {
+  const s = sc(z);
+  g.fillStyle = "rgba(60,40,50,0.25)";
+  g.beginPath(); g.ellipse(sx(x, s), sy(0, s), rx * s, rx * s * 0.35, 0, 0, 7); g.fill();
+}
+// Vector painter for one soldier with feet at (X, Y) and height h (logical px).
+function paintSoldier(c, X, Y, h, col, dark, light, phase, facing) {
+  c.fillStyle = "rgba(60,40,50,0.22)";
+  c.beginPath(); c.ellipse(X, Y, h * 0.28, h * 0.1, 0, 0, 7); c.fill();
+  const sw = Math.sin(phase) * h * 0.12;                       // running legs
+  c.fillStyle = dark;
+  c.fillRect(X - h * 0.17, Y - h * 0.34 + Math.max(0, sw), h * 0.13, h * 0.34 - Math.max(0, sw));
+  c.fillRect(X + h * 0.04, Y - h * 0.34 + Math.max(0, -sw), h * 0.13, h * 0.34 - Math.max(0, -sw));
+  c.fillStyle = col;
+  c.beginPath(); c.ellipse(X, Y - h * 0.5, h * 0.2, h * 0.22, 0, 0, 7); c.fill();
+  if (facing > 0) { c.fillStyle = "#26303a"; c.fillRect(X + h * 0.1, Y - h * 0.72, h * 0.08, h * 0.3); }
+  c.fillStyle = col;
+  c.beginPath(); c.arc(X, Y - h * 0.84, h * 0.17, 0, 7); c.fill();
+  if (h > 4) { c.fillStyle = light; c.beginPath(); c.arc(X - h * 0.05, Y - h * 0.89, h * 0.06, 0, 7); c.fill(); }
+}
+// Soldiers are pre-rendered into small canvases keyed by (team, size, frame)
+// and blitted with drawImage, which is far cheaper than re-tracing paths.
+const FRAMES = 8, TAU = Math.PI * 2;
+function soldierSprite(mine, hq, frame) {
+  const key = (mine ? 1 : 0) + hq * 2 + frame * 4096;
+  let sp = SPRITES.get(key);
+  if (sp) return sp;
+  const h = hq / 4, w = h * 0.7 + 1, ht = h * 1.08 + 1;
+  const c = document.createElement("canvas");
+  c.width = Math.ceil(w * K); c.height = Math.ceil(ht * K);
+  const cx = c.getContext("2d");
+  cx.setTransform(K, 0, 0, K, 0, 0);
+  paintSoldier(cx, w / 2, h + 0.5, h,
+    mine ? C.me : C.foe, mine ? C.meDark : C.foeDark, mine ? C.meLight : C.foeLight,
+    frame / FRAMES * TAU, mine ? 1 : -1);
+  sp = { c, w: c.width / K, h: c.height / K, ax: w / 2, ay: h + 0.5 };
+  SPRITES.set(key, sp);
+  return sp;
+}
+function drawSoldier(x, z, mine, phase, scale) {
+  const s0 = sc(z), h = 5 * s0 * scale;
+  if (h < 0.7) return;
+  const X = sx(x, s0), Y = sy(0, s0);
+  const frame = (Math.floor(phase / TAU * FRAMES) % FRAMES + FRAMES) % FRAMES;
+  const sp = soldierSprite(mine, Math.max(3, Math.round(h * 4)), frame);
+  g.drawImage(sp.c, X - sp.ax, Y - sp.ay, sp.w, sp.h);
+}
+// FORM indices ordered far-to-near so a group can be drawn without sorting
+const FORM_ORDER = FORM.map((f, i) => i).sort((a, b) => FORM[b][1] - FORM[a][1]);
+function drawGroup(x, z, n, mine, phase) {
+  const k = Math.min(n, MAX_DRAWN);
+  for (const i of FORM_ORDER) {
+    if (i >= k) continue;
+    const f = FORM[i];
+    drawSoldier(x + f[0] * FS, z + f[1] * FS, mine, phase + i * (mine ? 1.3 : 1), 1);
+  }
+}
+function pill(X, Y, txt, bg, size) {
+  g.font = `800 ${size}px system-ui, sans-serif`;
+  const w = g.measureText(txt).width + size * 0.9;
+  g.fillStyle = bg; g.beginPath(); g.roundRect(X - w / 2, Y - size * 0.7, w, size * 1.4, size * 0.7); g.fill();
+  g.fillStyle = "#fff"; g.textAlign = "center"; g.textBaseline = "middle"; g.fillText(txt, X, Y + size * 0.05);
+}
+function label(X, Y, txt, col, size) {
+  g.font = `900 ${size}px system-ui, sans-serif`; g.textAlign = "center"; g.textBaseline = "middle";
+  g.lineJoin = "round"; g.lineWidth = size * 0.22; g.strokeStyle = "rgba(0,0,0,0.55)";
+  g.strokeText(txt, X, Y); g.fillStyle = col; g.fillText(txt, X, Y);
+}
+
+function drawGate(o) {
+  const s = sc(o.z);
+  for (let side = 0; side < 2; side++) {
+    const op = o.ops[side], good = opGood(op);
+    const x0 = side ? 2 : -ROAD + 2, x1 = side ? ROAD - 2 : -2;
+    const X0 = sx(x0, s), X1 = sx(x1, s), Y0 = sy(16, s), Y1 = sy(4, s);
+    // posts
+    g.fillStyle = C.post;
+    g.fillRect(X0 - 1.2 * s, Y0, 2.4 * s, sy(0, s) - Y0);
+    g.fillRect(X1 - 1.2 * s, Y0, 2.4 * s, sy(0, s) - Y0);
+    // panel
+    g.globalAlpha = o.used ? 0.3 : 0.82;
+    g.fillStyle = good ? C.good : C.bad; g.fillRect(X0, Y0, X1 - X0, Y1 - Y0);
+    g.fillStyle = good ? C.goodEdge : C.badEdge; g.fillRect(X0, Y0, X1 - X0, 1.2 * s);
+    g.globalAlpha = 1;
+    if (!o.used) label((X0 + X1) / 2, (Y0 + Y1) / 2 + 0.6 * s, opLabel(op), C.text, 6.5 * s);
+  }
+  if (!o.used && state.mode === "play" && straddling()) {
+    // hint: centred squad will take both gates
+    g.fillStyle = "#7fffd4"; g.fillRect(sx(-1.5, s), sy(17, s), 3 * s, sy(0, s) - sy(17, s));
+  }
+}
+
+function drawCrate(o) {
+  const x0 = o.x - 8, x1 = o.x + 8, z0 = o.z - 6, z1 = o.z + 6, h = 12;
+  shadow(o.x, o.z, 11);
+  if (x0 > 0) quad([[x0, 0, z0], [x0, 0, z1], [x0, h, z1], [x0, h, z0]], C.crateDark);
+  if (x1 < 0) quad([[x1, 0, z0], [x1, 0, z1], [x1, h, z1], [x1, h, z0]], C.crateDark);
+  quad([[x0, h, z1], [x1, h, z1], [x1, h, z0], [x0, h, z0]], C.crateTop);
+  quad([[x0, 0, z0], [x1, 0, z0], [x1, h, z0], [x0, h, z0]], C.crate);
+  const s = sc(z0);
+  g.strokeStyle = C.crateDark; g.lineWidth = Math.max(0.5, 0.7 * s);
+  g.strokeRect(sx(x0 + 1, s), sy(h - 1, s), 14 * s, 10 * s);
+  pill(sx(o.x, s), sy(h / 2, s), fmt(o.hp), "rgba(60,30,10,0.75)", 4.6 * s);
+  // reward sign on top
+  const st = sc(o.z);
+  const SX = sx(o.x, st), SY = sy(h + 9, st), sw = 13 * st, sh = 10 * st;
+  g.fillStyle = "#f4f4f4"; g.beginPath(); g.roundRect(SX - sw / 2, SY - sh / 2, sw, sh, 1.5 * st); g.fill();
+  g.fillStyle = C.post; g.fillRect(SX - 0.5 * st, SY + sh / 2, 1 * st, sy(h, st) - SY - sh / 2);
+  label(SX, SY + 0.3 * st, "+" + fmt(o.reward), C.me, 5 * st);
+}
+
+// The boss: a horned brute with a spiked club. Drawn in screen space around his
+// feet (X, Y); u = pixels per world unit at his depth. He is ~30 units tall.
+function drawBoss(o) {
+  const u = sc(o.z), X = sx(o.x, u), Y = sy(0, u);
+  const P = (dx, dy) => [X + dx * u, Y - dy * u];
+  const poly = (pts, col) => { g.fillStyle = col; g.beginPath(); pts.forEach((p, i) => { const [a, b] = P(p[0], p[1]); i ? g.lineTo(a, b) : g.moveTo(a, b); }); g.closePath(); g.fill(); };
+  const circ = (dx, dy, r, col) => { const [a, b] = P(dx, dy); g.fillStyle = col; g.beginPath(); g.arc(a, b, r * u, 0, 7); g.fill(); };
+  const body = "#d42a30", dark = "#8e161c", darker = "#5c0d12", metal = "#9aa3ad", metalDark = "#5d6670";
+
+  // smash cycle once planted, walking cycle while approaching
+  const smash = o.planted ? (o.swing % 8) / 8 : 0;          // 0..1
+  const step = o.planted ? 0 : Math.sin(o.swing * 0.25);
+
+  // shadow
+  g.fillStyle = "rgba(60,40,50,0.3)";
+  g.beginPath(); g.ellipse(X, Y, 14 * u, 4 * u, 0, 0, 7); g.fill();
+
+  // legs
+  poly([[-7, 0 + Math.max(0, step) * 2], [-2, 0 + Math.max(0, step) * 2], [-2, 10], [-7, 10]], darker);
+  poly([[2, 0 + Math.max(0, -step) * 2], [7, 0 + Math.max(0, -step) * 2], [7, 10], [2, 10]], darker);
+  poly([[-8, Math.max(0, step) * 2], [-1.5, Math.max(0, step) * 2], [-1.5, 2], [-8, 2]], "#2a2a2a");   // boots
+  poly([[1.5, Math.max(0, -step) * 2], [8, Math.max(0, -step) * 2], [8, 2], [1.5, 2]], "#2a2a2a");
+
+  // left arm (hangs, fist)
+  poly([[-12, 21], [-16, 20], [-15, 10], [-11, 11]], dark);
+  circ(-13.5, 9.5, 2.6, body);
+
+  // torso: V-shaped, wide shoulders
+  poly([[-8, 10], [8, 10], [12, 22], [-12, 22]], body);
+  poly([[-8, 10], [8, 10], [8, 12.5], [-8, 12.5]], "#1e1e1e");                 // belt
+  poly([[-1.5, 10.3], [1.5, 10.3], [1.5, 12.2], [-1.5, 12.2]], "#f2c230");      // buckle
+  poly([[-1, 13], [1, 13], [0.6, 20], [-0.6, 20]], dark);                       // chest line
+  poly([[-9, 18], [-2, 17], [-2, 19], [-9, 20]], dark);                         // pecs
+  poly([[9, 18], [2, 17], [2, 19], [9, 20]], dark);
+
+  // shoulder pads with spikes
+  for (const sgn of [-1, 1]) {
+    circ(sgn * 11.5, 21.5, 4, metalDark);
+    circ(sgn * 11.5, 22, 3.4, metal);
+    poly([[sgn * 9.5, 24.5], [sgn * 10.5, 28.5], [sgn * 11.8, 25]], "#e8e8e8");
+    poly([[sgn * 12.5, 24.8], [sgn * 14.5, 28], [sgn * 14.6, 23.6]], "#e8e8e8");
+  }
+
+  // head + horned helmet
+  poly([[-4.5, 22], [4.5, 22], [4, 29], [-4, 29]], body);
+  poly([[-5, 27], [5, 27], [4, 31.5], [-4, 31.5]], metal);                      // helmet
+  poly([[-5, 27], [5, 27], [5, 28], [-5, 28]], metalDark);
+  poly([[-4.5, 29.5], [-9, 34], [-7.5, 30], [-5, 28]], "#f1ead8");              // horns
+  poly([[4.5, 29.5], [9, 34], [7.5, 30], [5, 28]], "#f1ead8");
+  poly([[-3.5, 25.8], [-0.8, 25], [-0.8, 24.2], [-3.5, 24.8]], "#ffe14a");       // angry eyes
+  poly([[3.5, 25.8], [0.8, 25], [0.8, 24.2], [3.5, 24.8]], "#ffe14a");
+  poly([[-2.2, 22.8], [2.2, 22.8], [2.2, 23.6], [-2.2, 23.6]], "#2a0507");      // mouth
+
+  // right arm + spiked club, rotating around the shoulder
+  const [shx, shy] = P(11.5, 20);
+  const ang = o.planted ? (smash < 0.5 ? -2.6 + smash * 1.2 : -2.0 + (smash - 0.5) * 4.4) : -0.5 + step * 0.3;
+  g.save(); g.translate(shx, shy); g.rotate(ang + Math.PI / 2); g.scale(u, u);
+  g.fillStyle = dark; g.fillRect(-2, 0, 4, 9);                                  // arm
+  g.fillStyle = body; g.beginPath(); g.arc(0, 10, 2.6, 0, 7); g.fill();        // fist
+  g.fillStyle = "#6b4423"; g.fillRect(-1, 8, 2, 14);                            // handle
+  g.fillStyle = metalDark; g.beginPath(); g.ellipse(0, 23, 3.2, 4.5, 0, 0, 7); g.fill();
+  g.fillStyle = "#e8e8e8";
+  for (const [a, b, c, d2] of [[-3, 20, -5.5, 21], [3, 20, 5.5, 21], [-3, 25, -5.5, 26], [3, 25, 5.5, 26], [-1, 27, 0, 30]]) {
+    g.beginPath(); g.moveTo(a, b); g.lineTo(c, d2); g.lineTo(a * 0.6, b + 2.5); g.fill();
+  }
+  g.restore();
+
+  // HP bar
+  const s = u, Y2 = sy(38, s), bw = 30 * s, X2 = X;
+  return drawBossBar(o, X2, Y2, bw, s);
+}
+function drawBossBar(o, X, Y, bw, s) {
+  g.fillStyle = "rgba(0,0,0,0.5)"; g.beginPath(); g.roundRect(X - bw / 2, Y - 1.6 * s, bw, 3.2 * s, 1.6 * s); g.fill();
+  g.fillStyle = C.bad; g.beginPath(); g.roundRect(X - bw / 2, Y - 1.6 * s, bw * o.hp / o.max, 3.2 * s, 1.6 * s); g.fill();
+  label(X, Y - 5 * s, fmt(o.hp), C.text, 5 * s);
+}
+
+function draw() {
+  const s = state;
+  g.setTransform(K, 0, 0, K, 0, 0);
+  if (s.shake) g.translate((rint(0, 4) - 2) * 0.6, (rint(0, 4) - 2) * 0.6);
+  drawWorld();
+
+  // depth-sort whole objects (a handful), not individual soldiers
+  const phase = s.t * 0.55;
+  const order = DRAW_LIST; order.length = 0;
+  for (const o of s.objs) order.push(o);
+  if (s.mode !== "title" && s.n > 0) order.push(PLAYER_ITEM);
+  if (s.bullets.length) order.push(BULLET_ITEM);
+  order.sort((a, b) => b.z - a.z);
+  for (const o of order) {
+    if (o.type === "enemy") {
+      drawGroup(o.x, o.z, o.n, false, phase);
+      const sz = sc(o.z);
+      pill(sx(o.x, sz), sy(12, sz) - radius(o.n) * sz * 0.4, fmt(o.n), "rgba(150,20,25,0.85)", 5 * sz);
+    } else if (o.type === "gate") drawGate(o);
+    else if (o.type === "crate") drawCrate(o);
+    else if (o.type === "boss") drawBoss(o);
+    else if (o === PLAYER_ITEM) drawGroup(s.px, PZ, s.n, true, phase);
+    else if (o === BULLET_ITEM) {
+      // all bullets in a single path / single stroke
+      g.strokeStyle = C.bullet; g.lineWidth = 1.2; g.lineCap = "round";
+      g.beginPath();
+      for (const b of s.bullets) {
+        const s0 = sc(b.z), s1 = sc(b.z + 7);
+        g.moveTo(sx(b.x, s0), sy(3.5, s0)); g.lineTo(sx(b.x, s1), sy(3.5, s1));
+      }
+      g.stroke();
+    }
+  }
+
+  for (const p of s.fx) { const s0 = sc(p.z); g.fillStyle = p.col; g.fillRect(sx(p.x, s0), sy(p.y, s0), 1.1 * s0, 1.1 * s0); }
+
+  // distance fog
+  g.fillStyle = grads().fog; g.fillRect(0, HOR, W, 70 - HOR);
+
+  // squad count + floating texts
+  if (s.mode !== "title" && s.n > 0) {
+    const s0 = sc(PZ);
+    pill(sx(s.px, s0), sy(9, s0) - radius(s.n) * s0 * 0.45, fmt(s.n), "rgba(20,60,150,0.88)", 9);
+  }
+  for (const t of s.texts) {
+    const s0 = sc(t.z);
+    g.globalAlpha = Math.min(1, t.t / 10);
+    label(sx(t.x, s0), sy(t.y, s0), t.txt, t.col, 13);
+    g.globalAlpha = 1;
+  }
+
+  g.setTransform(K, 0, 0, K, 0, 0);
+  if (s.mode !== "title") drawHUD();
+  drawOverlay();
+}
+const DRAW_LIST = [], PLAYER_ITEM = { z: PZ }, BULLET_ITEM = { z: PZ + 14 };
+// gradients are created once (they only depend on constants)
+function grads() {
+  if (GRAD) return GRAD;
+  const sea = g.createLinearGradient(0, HOR, 0, H);
+  sea.addColorStop(0, C.waterFar); sea.addColorStop(0.35, C.water); sea.addColorStop(1, "#246d99");
+  const fog = g.createLinearGradient(0, HOR, 0, 70);
+  fog.addColorStop(0, "rgba(200,232,245,0.75)"); fog.addColorStop(1, "rgba(200,232,245,0)");
+  return GRAD = { sea, fog };
+}
+
+function drawHUD() {
+  const s = state;
+  // level pill with progress to next boss
+  const pw = 130, X = W / 2 - pw / 2, Y = 6;
+  g.fillStyle = "rgba(30,50,70,0.85)"; g.beginPath(); g.roundRect(X, Y, pw, 15, 7.5); g.fill();
+  const prog = s.bossAlive ? 1 : Math.min(1, (s.dist - s.lastBoss) / (s.nextBoss - s.lastBoss));
+  g.fillStyle = s.bossAlive ? C.bad : "#3fb0ff";
+  g.beginPath(); g.roundRect(X + 2, Y + 2, Math.max(11, (pw - 4) * prog), 11, 5.5); g.fill();
+  g.fillStyle = "#fff"; g.font = "900 9.5px system-ui, sans-serif"; g.textAlign = "center"; g.textBaseline = "middle";
+  g.fillText(s.bossAlive ? "BOSS FIGHT" : "LVL " + (level() + 1), W / 2, Y + 8);
+  g.textAlign = "left"; g.font = "800 9px system-ui, sans-serif";
+  label(30, 14, Math.floor(s.dist / 10) + " m", C.text, 10);
+  label(W - 34, 14, "BEST " + best, "#e8f4ff", 8);
+  label(W - 34, 25, D().name, D().col, 7);
+}
+
+function drawOverlay() {
+  const s = state;
+  if (s.mode === "play" && !s.paused) return;
+  g.fillStyle = "rgba(10,25,40,0.55)"; g.fillRect(0, 0, W, H);
+  if (s.mode === "title") {
+    label(W / 2, 58, "SQUAD RUSH", C.gold, 34);
+    label(W / 2, 88, "grow your squad · blast the horde", C.text, 11);
+    for (let i = 0; i < 18; i++) {
+      const f = FORM[i];
+      drawSoldier(f[0] * 0.9, 16 + f[1] * 0.5, true, s.t * 0.4 + i, 1.4);
+    }
+    label(W / 2, 170, "◀  " + D().name + "  ▶", D().col, 14);
+    if ((s.t >> 4) & 1) label(W / 2, 192, "← → difficulty  ·  ENTER or tap to start", C.text, 10);
+    label(W / 2, 210, "best " + best + " m", "#cde", 9);
+  } else if (s.mode === "over") {
+    label(W / 2, 70, "SQUAD WIPED OUT", C.bad, 26);
+    label(W / 2, 104, Math.floor(s.dist / 10) + " m  ·  " + fmt(s.kills) + " kills  ·  " + D().name, C.text, 13);
+    label(W / 2, 146, "best " + best + " m", "#cde", 10);
+    if (s.newBest) label(W / 2, 128, "NEW BEST!", C.gold, 16);
+    if ((s.t >> 4) & 1) label(W / 2, 172, "press ENTER or tap to retry", C.text, 12);
+  } else {
+    label(W / 2, H / 2, "PAUSED", C.text, 24);
+  }
+}
+
+// ---- fx-CG50 preview renderer -------------------------------------------------
+// Open the page with ?cg50 to see roughly what the calculator port looks like.
+// It only uses what a PrizmSDK/libfxcg add-in can cheaply do: a 396x224
+// RGB565 framebuffer, solid rectangles, solid convex polygons and a blocky
+// 3x5 pixel font. No alpha, no gradients, no anti-aliasing, max 30 soldiers
+// drawn per group. The C port will mirror these functions one-to-one.
+const CG_MAX_DRAWN = 30;
+const FB = new Uint16Array(W * H);
+
+function c565(hex) {
+  const v = parseInt(hex.slice(1), 16);
+  return (((v >> 16) & 0xff) >> 3) << 11 | (((v >> 8) & 0xff) >> 2) << 5 | ((v & 0xff) >> 3);
+}
+const K5 = {};
+for (const [k, v] of Object.entries({
+  sky: "#bfe6f5", seaFar: "#6fb4d6", sea: "#2f86b8", seaNear: "#2a78a8", wave: "#7cc4e8",
+  road: "#cbbdbb", roadEdge: "#b3a4a3", dash: "#ffffff",
+  wallTop: "#bdbdbd", wallIn: "#8e8e8e", wallFront: "#a5a5a5", pillarTop: "#9a9a9a", pillarFront: "#7b7b7b",
+  me: "#2f7bf0", meDark: "#1a4fb0", meLight: "#9cc4ff", foe: "#e8343a", foeDark: "#9c1c22",
+  skin: "#f8c890", gun: "#26303a", good: "#2f8cff", goodEdge: "#bfe0ff", bad: "#ff3b3b", badEdge: "#ffc4c4",
+  post: "#55606a", crate: "#d4883c", crateTop: "#e9a65e", crateDark: "#8a5020",
+  bullet: "#7fd8ff", gold: "#ffd23a", white: "#ffffff", black: "#000000", shadow: "#20303c",
+  pillMe: "#1c3c96", pillFoe: "#961418", panel: "#16283a", panelEdge: "#3a5a7a", grey: "#9aa3ad",
+  greyDark: "#5d6670", bone: "#f1ead8", eye: "#ffe14a", hpBack: "#300000", aqua: "#7fffd4",
+})) K5[k] = c565(v);
+
+// -- primitives (these map directly to C) --
+function cgRect(x0, y0, x1, y1, c) {           // fills [x0,x1) x [y0,y1)
+  x0 = Math.max(0, Math.round(x0)); y0 = Math.max(0, Math.round(y0));
+  x1 = Math.min(W, Math.round(x1)); y1 = Math.min(H, Math.round(y1));
+  for (let y = y0; y < y1; y++) FB.fill(c, y * W + x0, y * W + x1);
+}
+function cgPoly(pts, c) {                       // convex polygon, scanline fill
+  let ymin = 1e9, ymax = -1e9;
+  for (const p of pts) { if (p[1] < ymin) ymin = p[1]; if (p[1] > ymax) ymax = p[1]; }
+  const y0 = Math.max(0, Math.ceil(ymin - 0.5)), y1 = Math.min(H - 1, Math.floor(ymax - 0.5));
+  const n = pts.length;
+  for (let y = y0; y <= y1; y++) {
+    const yc = y + 0.5;
+    let xl = 1e9, xr = -1e9;
+    for (let i = 0; i < n; i++) {
+      const a = pts[i], b = pts[(i + 1) % n];
+      if ((a[1] <= yc && b[1] > yc) || (b[1] <= yc && a[1] > yc)) {
+        const x = a[0] + (yc - a[1]) * (b[0] - a[0]) / (b[1] - a[1]);
+        if (x < xl) xl = x; if (x > xr) xr = x;
+      }
+    }
+    if (xl > xr) continue;
+    const a = Math.max(0, Math.round(xl)), b = Math.min(W, Math.round(xr));
+    if (b > a) FB.fill(c, y * W + a, y * W + b);
+  }
+}
+function cgQuad(pts3, c) {                      // world-space quad
+  cgPoly(pts3.map(([x, y, z]) => { const s = sc(z); return [sx(x, s), sy(y, s)]; }), c);
+}
+
+// -- 3x5 pixel font --
+const GLYPH = {
+  "0": "111101101101111", "1": "010110010010111", "2": "111001111100111", "3": "111001111001111",
+  "4": "101101111001001", "5": "111100111001111", "6": "111100111101111", "7": "111001001010010",
+  "8": "111101111101111", "9": "111101111001111",
+  A: "010101111101101", B: "110101110101110", C: "011100100100011", D: "110101101101110",
+  E: "111100110100111", F: "111100110100100", G: "011100101101011", H: "101101111101101",
+  I: "111010010010111", J: "001001001101010", K: "101101110101101", L: "100100100100111",
+  M: "101111111101101", N: "110101101101101", O: "010101101101010", P: "110101110100100",
+  Q: "010101101110011", R: "110101110101101", S: "011100010001110", T: "111010010010010",
+  U: "101101101101111", V: "101101101101010", W: "101101111111101", X: "101101010101101",
+  Y: "101101010010010", Z: "111001010100111",
+  "+": "000010111010000", "-": "000000111000000", "×": "000101010101000", "÷": "010000111000010",
+  "√": "001001101011001", ".": "000000000000010", "!": "010010010000010", "/": "001001010100100",
+  "<": "001010100010001", ">": "100010001010100", ":": "000010000010000", " ": "000000000000000",
+};
+function cgTextW(str, s) {
+  let w = 0;
+  for (const ch of str) w += (ch === "²" || ch === "³") ? 3 * Math.max(1, s - 1) + 1 : 4 * s;
+  return w - s;
+}
+function cgGlyph(ch, x, y, s, c) {
+  const gl = GLYPH[ch] || GLYPH[ch.toUpperCase()] || GLYPH[" "];
+  for (let r = 0; r < 5; r++) for (let k = 0; k < 3; k++)
+    if (gl[r * 3 + k] === "1") cgRect(x + k * s, y + r * s, x + k * s + s, y + r * s + s, c);
+}
+// draws text centred at (x, y) with a 1px drop shadow
+function cgText(str, x, y, s, c, align = "c", shadow = true) {
+  str = String(str);
+  let X = Math.round(align === "c" ? x - cgTextW(str, s) / 2 : align === "r" ? x - cgTextW(str, s) : x);
+  const Y = Math.round(y - 2.5 * s);
+  for (const pass of shadow ? [0, 1] : [1]) {
+    let px = X + (pass ? 0 : 1);
+    const col = pass ? c : K5.black, py = Y + (pass ? 0 : 1);
+    for (const ch of str) {
+      if (ch === "²" || ch === "³") {           // superscript 2 / 3
+        const ss = Math.max(1, s - 1);
+        cgGlyph(ch === "²" ? "2" : "3", px, py - s, ss, col);
+        px += 3 * ss + 1;
+      } else { cgGlyph(ch, px, py, s, col); px += 4 * s; }
+    }
+  }
+}
+function cgPill(x, y, str, s, bg) {
+  const w = cgTextW(str, s) + 4 * s, h = 5 * s + 2 * s;
+  cgRect(x - w / 2, y - h / 2, x + w / 2, y + h / 2, bg);
+  cgRect(x - w / 2 + 1, y - h / 2 - 1, x + w / 2 - 1, y - h / 2, bg);
+  cgRect(x - w / 2 + 1, y + h / 2, x + w / 2 - 1, y + h / 2 + 1, bg);
+  cgText(str, x, y, s, K5.white, "c", false);
+}
+function txtScale(s0) { return s0 > 2.2 ? 2 : 1; }
+
+// -- world --
+function cgWorld() {
+  const s = state, d = s.dist;
+  cgRect(0, 0, W, HOR + 2, K5.sky);
+  cgRect(0, HOR + 2, W, 40, K5.seaFar);
+  cgRect(0, 40, W, 150, K5.sea);
+  cgRect(0, 150, W, H, K5.seaNear);
+  const base = Math.floor(d / 16);
+  for (let k = 0; k < 30; k++) {
+    const z = k * 16 - (d % 16), row = base + k;
+    if (z < -12) continue;
+    const s0 = sc(z);
+    for (let j = 0; j < 3; j++) {
+      const h = hash(row * 7 + j), x = 66 + (h % 160), side = (h >> 9) & 1 ? 1 : -1;
+      const wx = sx(side * x, s0), wy = sy(-14, s0);
+      cgRect(wx - 3 * s0, wy, wx + 3 * s0, wy + 1, K5.wave);
+    }
+  }
+  const ZN = -14, ZF = FAR + 60;
+  for (let k = Math.ceil((ZF + d) / 48); k * 48 - d > ZN - 20; k--) {
+    const z = k * 48 - d;
+    for (const side of [-1, 1]) {
+      const xi = side * 55, xo = side * 66;
+      cgQuad([[xi, 2, z + 14], [xo, 2, z + 14], [xo, 2, z], [xi, 2, z]], K5.pillarTop);
+      cgQuad([[xi, 2, z], [xo, 2, z], [xo, -14, z], [xi, -14, z]], K5.pillarFront);
+    }
+  }
+  cgQuad([[-ROAD, 0, ZF], [ROAD, 0, ZF], [ROAD, 0, ZN], [-ROAD, 0, ZN]], K5.road);
+  cgQuad([[-ROAD, 0, ZF], [-ROAD + 5, 0, ZF], [-ROAD + 5, 0, ZN], [-ROAD, 0, ZN]], K5.roadEdge);
+  cgQuad([[ROAD - 5, 0, ZF], [ROAD, 0, ZF], [ROAD, 0, ZN], [ROAD - 5, 0, ZN]], K5.roadEdge);
+  for (let z = ZF - ((ZF + d) % 30); z > ZN - 30; z -= 30)
+    cgQuad([[-0.8, 0, z + 12], [0.8, 0, z + 12], [0.8, 0, z], [-0.8, 0, z]], K5.dash);
+  for (const side of [-1, 1]) {
+    const xi = side * ROAD, xo = side * 55;
+    cgQuad([[xi, 0, ZF], [xi, 4, ZF], [xi, 4, ZN], [xi, 0, ZN]], K5.wallIn);
+    cgQuad([[xi, 4, ZF], [xo, 4, ZF], [xo, 4, ZN], [xi, 4, ZN]], K5.wallTop);
+  }
+  for (let k = Math.ceil((ZF + d) / 24); k * 24 - d > ZN - 12; k--) {
+    const z = k * 24 - d;
+    for (const side of [-1, 1]) {
+      const xi = side * (ROAD + 0.5), xo = side * 55;
+      cgQuad([[xi, 4, z + 10], [xi, 8, z + 10], [xi, 8, z], [xi, 4, z]], K5.wallIn);
+      cgQuad([[xi, 8, z + 10], [xo, 8, z + 10], [xo, 8, z], [xi, 8, z]], K5.wallTop);
+      cgQuad([[xi, 8, z], [xo, 8, z], [xo, 4, z], [xi, 4, z]], K5.wallFront);
+    }
+  }
+}
+
+// -- soldiers: just 4-6 rectangles each --
+function cgSoldier(x, z, mine, frame, scale) {
+  const s0 = sc(z), h = Math.round(5 * s0 * scale);
+  if (h < 2) return;
+  const X = Math.round(sx(x, s0)), Y = Math.round(sy(0, s0));
+  const col = mine ? K5.me : K5.foe, dark = mine ? K5.meDark : K5.foeDark;
+  if (h < 5) { cgRect(X - 1, Y - h, X + 1, Y, col); return; }
+  const bw = Math.max(2, Math.round(h * 0.42)), hw = Math.max(2, Math.round(h * 0.32));
+  const lw = Math.max(1, Math.round(h * 0.14)), lh = Math.max(1, Math.round(h * 0.3));
+  const up = frame & 1;
+  cgRect(X - bw / 2, Y - lh + (up ? 1 : 0), X - bw / 2 + lw, Y, dark);              // legs
+  cgRect(X + bw / 2 - lw, Y - lh + (up ? 0 : 1), X + bw / 2, Y, dark);
+  cgRect(X - bw / 2, Y - lh - Math.round(h * 0.4), X + bw / 2, Y - lh, col);       // body
+  const hy = Y - lh - Math.round(h * 0.4);
+  cgRect(X - hw / 2, hy - hw, X + hw / 2, hy, col);                                  // head
+  if (h >= 8) cgRect(X - hw / 2 + 1, hy - hw + 1, X - hw / 2 + 2, hy - hw + 2, mine ? K5.meLight : K5.white);
+  if (mine) cgRect(X + bw / 2 - 1, hy - 1, X + bw / 2 + 1, Y - lh - 1, K5.gun);     // gun
+}
+function cgGroup(x, z, n, mine) {
+  const k = Math.min(n, CG_MAX_DRAWN);
+  for (const i of FORM_ORDER) {
+    if (i >= k) continue;
+    const f = FORM[i];
+    cgSoldier(x + f[0] * FS, z + f[1] * FS, mine, (state.t >> 2) + i, 1);
+  }
+}
+
+function cgGate(o) {
+  const s = sc(o.z), ts = s > 1.1 ? 2 : 1;
+  for (let side = 0; side < 2; side++) {
+    const op = o.ops[side], good = opGood(op);
+    const X0 = sx(side ? 2 : -ROAD + 2, s), X1 = sx(side ? ROAD - 2 : -2, s);
+    const Y0 = sy(16, s), Y1 = sy(4, s), G = sy(0, s);
+    cgRect(X0 - s, Y0, X0 + s, G, K5.post);
+    cgRect(X1 - s, Y0, X1 + s, G, K5.post);
+    if (o.used) continue;
+    cgRect(X0, Y0, X1, Y1, good ? K5.good : K5.bad);
+    cgRect(X0, Y0, X1, Y0 + Math.max(1, s), good ? K5.goodEdge : K5.badEdge);
+    cgText(opLabel(op), (X0 + X1) / 2, (Y0 + Y1) / 2, ts, K5.white);
+  }
+  if (!o.used && state.mode === "play" && straddling())
+    cgRect(sx(-1.5, s), sy(17, s), sx(1.5, s), sy(0, s), K5.aqua);
+}
+function cgCrate(o) {
+  const x0 = o.x - 8, x1 = o.x + 8, z0 = o.z - 6, z1 = o.z + 6, h = 12;
+  if (x0 > 0) cgQuad([[x0, 0, z0], [x0, 0, z1], [x0, h, z1], [x0, h, z0]], K5.crateDark);
+  if (x1 < 0) cgQuad([[x1, 0, z0], [x1, 0, z1], [x1, h, z1], [x1, h, z0]], K5.crateDark);
+  cgQuad([[x0, h, z1], [x1, h, z1], [x1, h, z0], [x0, h, z0]], K5.crateTop);
+  cgQuad([[x0, 0, z0], [x1, 0, z0], [x1, h, z0], [x0, h, z0]], K5.crate);
+  const s = sc(z0), ts = txtScale(s);
+  cgPill(sx(o.x, s), sy(h / 2, s), fmt(o.hp), ts, K5.crateDark);
+  const st = sc(o.z), SX = sx(o.x, st), SY = sy(h + 9, st);
+  cgRect(SX - 0.5 * st, SY, SX + 0.5 * st + 1, sy(h, st), K5.post);
+  cgRect(SX - 6.5 * st, SY - 5 * st, SX + 6.5 * st, SY + 5 * st, K5.white);
+  cgText("+" + fmt(o.reward), SX, SY, ts, K5.me, "c", false);
+}
+function cgBoss(o) {
+  const u = sc(o.z), X = sx(o.x, u), Y = sy(0, u);
+  const P = (dx, dy) => [X + dx * u, Y - dy * u];
+  const poly = (pts, c) => cgPoly(pts.map(p => P(p[0], p[1])), c);
+  const box = (x0, y0, x1, y1, c) => poly([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], c);
+  const step = o.planted ? 0 : (o.swing >> 3) & 1;
+  const body = K5.foe, dark = K5.foeDark;
+  box(-7, step * 2, -2, 10, K5.shadow); box(2, (1 - step) * 2, 7, 10, K5.shadow);      // legs
+  box(-8, step * 2, -1.5, 2 + step * 2, K5.black); box(1.5, (1 - step) * 2, 8, 2 + (1 - step) * 2, K5.black);
+  box(-16, 10, -11, 21, dark); box(-16, 8, -11, 11, body);                            // left arm
+  poly([[-8, 10], [8, 10], [12, 22], [-12, 22]], body);                               // torso
+  box(-8, 10, 8, 12.5, K5.black); box(-1.5, 10.3, 1.5, 12.2, K5.gold);                // belt
+  box(-1, 13, 1, 20, dark);
+  for (const sg of [-1, 1]) {                                                         // shoulders
+    box(sg * 8, 18, sg * 15, 25, K5.greyDark); box(sg * 8.8, 19, sg * 14.2, 24.2, K5.grey);
+    poly([[sg * 10, 25], [sg * 11, 28.5], [sg * 12, 25]], K5.bone);
+  }
+  box(-4.5, 22, 4.5, 29, body);                                                        // head
+  box(-5, 27, 5, 31.5, K5.grey); box(-5, 27, 5, 28, K5.greyDark);                     // helmet
+  poly([[-4.5, 29.5], [-9, 34], [-7.5, 30], [-5, 28]], K5.bone);                      // horns
+  poly([[4.5, 29.5], [9, 34], [7.5, 30], [5, 28]], K5.bone);
+  poly([[-3.5, 25.8], [-0.8, 25], [-0.8, 24.2], [-3.5, 24.8]], K5.eye);
+  poly([[3.5, 25.8], [0.8, 25], [0.8, 24.2], [3.5, 24.8]], K5.eye);
+  box(-2.2, 22.8, 2.2, 23.6, K5.black);
+  // club arm: rotate a few points around the shoulder (cheap: sin/cos once)
+  const smash = o.planted ? (o.swing % 8) / 8 : 0;
+  const ang = o.planted ? (smash < 0.5 ? -2.6 + smash * 1.2 : -2.0 + (smash - 0.5) * 4.4) : -0.5;
+  const ca = Math.cos(ang + Math.PI / 2), sa = Math.sin(ang + Math.PI / 2);
+  const [shx, shy] = P(11.5, 20);
+  const R = (ax, ay) => [shx + (ax * ca - ay * sa) * u, shy + (ax * sa + ay * ca) * u];
+  const rpoly = (pts, c) => cgPoly(pts.map(p => R(p[0], p[1])), c);
+  rpoly([[-2, 0], [2, 0], [2, 9], [-2, 9]], dark);
+  rpoly([[-2.5, 8], [2.5, 8], [2.5, 12], [-2.5, 12]], body);
+  rpoly([[-1, 11], [1, 11], [1, 20], [-1, 20]], K5.crateDark);
+  rpoly([[-3, 19], [3, 19], [3.5, 23], [2, 27], [-2, 27], [-3.5, 23]], K5.greyDark);
+  rpoly([[-3.5, 21], [-6, 22], [-3.5, 23]], K5.bone); rpoly([[3.5, 21], [6, 22], [3.5, 23]], K5.bone);
+  rpoly([[-1, 27], [0, 30], [1, 27]], K5.bone);
+  // HP bar
+  const hy = sy(38, u), bw = 30 * u;
+  cgRect(X - bw / 2, hy - 1.6 * u, X + bw / 2, hy + 1.6 * u, K5.hpBack);
+  cgRect(X - bw / 2, hy - 1.6 * u, X - bw / 2 + bw * Math.max(0, o.hp) / o.max, hy + 1.6 * u, K5.bad);
+  cgText(fmt(o.hp), X, hy - 5 * u, txtScale(u), K5.white);
+}
+
+function cgHUD() {
+  const s = state;
+  const pw = 130, X = W / 2 - pw / 2, Y = 5;
+  cgRect(X, Y, X + pw, Y + 15, K5.panel);
+  const prog = s.bossAlive ? 1 : Math.min(1, (s.dist - s.lastBoss) / (s.nextBoss - s.lastBoss));
+  cgRect(X + 2, Y + 2, X + 2 + Math.max(4, (pw - 4) * prog), Y + 13, s.bossAlive ? K5.bad : K5.good);
+  cgText(s.bossAlive ? "BOSS FIGHT" : "LVL " + (level() + 1), W / 2, Y + 8, 1, K5.white);
+  cgText(Math.floor(s.dist / 10) + "M", 6, 12, 2, K5.white, "l");
+  cgText("BEST " + best, W - 6, 10, 1, K5.white, "r");
+  cgText(D().name, W - 6, 20, 1, c565(D().col), "r");
+}
+function cgOverlay() {
+  const s = state;
+  if (s.mode === "play" && !s.paused) return;
+  // no transparency on the calculator: a solid panel instead of a dimmed screen
+  const bx0 = 58, by0 = 34, bx1 = W - 58, by1 = H - 24;
+  cgRect(bx0 - 2, by0 - 2, bx1 + 2, by1 + 2, K5.panelEdge);
+  cgRect(bx0, by0, bx1, by1, K5.panel);
+  if (s.mode === "title") {
+    cgText("SQUAD RUSH", W / 2, 58, 4, K5.gold);
+    cgText("GROW YOUR SQUAD - BLAST THE HORDE", W / 2, 82, 1, K5.white);
+    for (let i = 0; i < 12; i++) cgRect(W / 2 - 50 + i * 9, 100, W / 2 - 46 + i * 9, 110, i % 2 ? K5.me : K5.meDark);
+    cgText("< " + D().name + " >", W / 2, 132, 2, c565(D().col));
+    if ((s.t >> 4) & 1) cgText("LEFT/RIGHT: DIFFICULTY   EXE: START", W / 2, 158, 1, K5.white);
+    cgText("BEST " + best + "M", W / 2, 180, 1, K5.grey);
+  } else if (s.mode === "over") {
+    cgText("SQUAD WIPED OUT", W / 2, 64, 3, K5.bad);
+    cgText(Math.floor(s.dist / 10) + "M   " + fmt(s.kills) + " KILLS", W / 2, 98, 2, K5.white);
+    if (s.newBest) cgText("NEW BEST!", W / 2, 124, 2, K5.gold);
+    cgText("BEST " + best + "M", W / 2, 146, 1, K5.grey);
+    if ((s.t >> 4) & 1) cgText("EXE: RETRY", W / 2, 172, 1, K5.white);
+  } else cgText("PAUSED", W / 2, H / 2, 3, K5.white);
+}
+
+function drawCG() {
+  const s = state;
+  cgWorld();
+  const order = DRAW_LIST; order.length = 0;
+  for (const o of s.objs) order.push(o);
+  if (s.mode !== "title" && s.n > 0) order.push(PLAYER_ITEM);
+  if (s.bullets.length) order.push(BULLET_ITEM);
+  order.sort((a, b) => b.z - a.z);
+  for (const o of order) {
+    if (o.type === "enemy") {
+      cgGroup(o.x, o.z, o.n, false);
+      const sz = sc(o.z);
+      cgPill(sx(o.x, sz), sy(12, sz) - radius(o.n) * sz * 0.4, fmt(o.n), txtScale(sz), K5.pillFoe);
+    } else if (o.type === "gate") cgGate(o);
+    else if (o.type === "crate") cgCrate(o);
+    else if (o.type === "boss") cgBoss(o);
+    else if (o === PLAYER_ITEM) cgGroup(s.px, PZ, s.n, true);
+    else if (o === BULLET_ITEM) {
+      for (const b of s.bullets) {
+        const s0 = sc(b.z), s1 = sc(b.z + 7), X = sx(b.x, s0);
+        cgRect(X, sy(3.5, s1), X + 1, sy(3.5, s0) + 1, K5.bullet);
+      }
+    }
+  }
+  for (const p of s.fx) { const s0 = sc(p.z); const X = sx(p.x, s0), Y = sy(p.y, s0); cgRect(X, Y, X + 2, Y + 2, c565(p.col)); }
+  if (s.mode !== "title" && s.n > 0) {
+    const s0 = sc(PZ);
+    cgPill(sx(s.px, s0), sy(9, s0) - radius(s.n) * s0 * 0.45, fmt(s.n), 2, K5.pillMe);
+  }
+  for (const t of s.texts) { const s0 = sc(t.z); cgText(t.txt, sx(t.x, s0), sy(t.y, s0), 2, c565(t.col)); }
+  if (s.mode !== "title") cgHUD();
+  cgOverlay();
+
+  // present: RGB565 -> RGBA (this is what the LCD would show)
+  if (!CG_IMG) { CG_IMG = g.createImageData(W, H); CG_U32 = new Uint32Array(CG_IMG.data.buffer); }
+  for (let i = 0; i < FB.length; i++) {
+    const v = FB[i], r = (v >> 11) << 3, gg = ((v >> 5) & 63) << 2, b = (v & 31) << 3;
+    CG_U32[i] = 0xff000000 | (b | b >> 5) << 16 | (gg | gg >> 6) << 8 | (r | r >> 5);
+  }
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.putImageData(CG_IMG, 0, 0);
+}
+
+// ---- main loop ------------------------------------------------------------------
+let last = performance.now(), acc = 0;
+let showFps = false, fpsN = 0, fpsT = 0, fps = 0;
+function frame(now) {
+  fpsN++;
+  if (now - fpsT >= 500) { fps = Math.round(fpsN * 1000 / (now - fpsT)); fpsN = 0; fpsT = now; }
+  acc += Math.min(250, now - last); last = now;
+  while (acc >= TICK) {
+    if (tapped) {
+      tapped = false;
+      if (state.mode === "title" || (state.mode === "over" && state.overT > 20)) newGame();
+    }
+    update(); acc -= TICK;
+    if (state.mode === "over") state.overT++;
+  }
+  (CG ? drawCG : draw)();
+  if (showFps) { g.setTransform(K, 0, 0, K, 0, 0); label(16, H - 8, fps + " fps", "#9f9", 8); }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
