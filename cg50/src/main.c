@@ -6,7 +6,8 @@
  * polygons drawn straight into the 384x216 RGB565 VRAM, a 3x5 pixel font.
  *
  * Controls:  LEFT/RIGHT move    EXE start/confirm    EXIT/OPTN/F1 pause
- *            MENU (while paused) back to the calculator's main menu
+ *            MENU back to the calculator's main menu (the run is saved first, so
+ *            you can pick CONTINUE when you come back)
  */
 #include <fxcg/display.h>
 #include <fxcg/keyboard.h>
@@ -14,6 +15,7 @@
 #include <fxcg/file.h>
 #include <fxcg/system.h>
 #include <string.h>
+#include <stddef.h>
 
 #ifndef KEY_PRGM_EXE
 #define KEY_PRGM_EXE 31      /* matrix code for EXE (not defined in this SDK version) */
@@ -43,7 +45,8 @@ static u16 *vram;
 #define MAX_BULLETS 80
 #define MAX_OBJS 32
 #define MAX_FX 60
-#define MAX_TEXTS 8
+#define MAX_TEXTS 12
+#define MAX_ZONES 4
 #define MAX_N 1000000000000000LL   /* 1e15: effectively unlimited */
 
 static const signed char FORM[60][2] = {{0,0},{-2,2},{0,-4},{3,4},{-6,-1},{6,-3},{-2,6},{-4,-6},{9,2},{-9,3},{4,-7},{3,8},{-10,-4},{11,-2},{-7,8},{-2,-10},{10,7},{-13,0},{10,-8},{-1,11},{-9,-9},{15,2},{-12,7},{3,-12},{8,11},{-15,-4},{15,-5},{-6,12},{-6,-13},{15,6},{-17,4},{10,-12},{3,14},{-15,-9},{19,-1},{-13,11},{0,-15},{13,12},{-20,-1},{16,-10},{-4,16},{-11,-14},{20,4},{-19,8},{7,-16},{8,16},{-20,-7},{21,-5},{-11,15},{-5,-18},{18,10},{-23,2},{15,-14},{1,19},{-17,-13},{24,1},{-18,12},{3,-19},{14,16},{-24,-4}};
@@ -94,6 +97,8 @@ static unsigned char FORM_ORDER[60];
 #define C_EYE       RGB(0xff,0xe1,0x4a)
 #define C_HPBACK    RGB(0x30,0x00,0x00)
 #define C_AQUA      RGB(0x7f,0xff,0xd4)
+#define C_HURT      RGB(0xb0,0x20,0x20)
+#define C_SPARK     RGB(0xff,0xe9,0xa0)
 
 /* ---------------------------------------------------------------- difficulty */
 typedef struct {
@@ -101,10 +106,10 @@ typedef struct {
     float enemy; int twoGood; float boss, speed, crate, bad; int start;
 } Diff;
 static const Diff DIFFS[4] = {
-    {"EASY",   RGB(0x3f,0xd2,0x7a), 1.0f, 25, 1.0f, 1.00f, 1, 1.0f, 5},
-    {"NORMAL", RGB(0x3f,0xb0,0xff), 1.6f, 12, 1.7f, 1.12f, 2, 1.4f, 8},
-    {"HARD",   RGB(0xff,0x9a,0x2e), 2.4f,  5, 2.6f, 1.25f, 3, 1.9f, 12},
-    {"INSANE", RGB(0xff,0x3b,0x3b), 3.5f,  0, 4.0f, 1.40f, 5, 2.6f, 18},
+    {"EASY",   RGB(0x3f,0xd2,0x7a), 1.25f, 45, 1.0f, 1.00f, 1, 1.0f, 5},
+    {"NORMAL", RGB(0x3f,0xb0,0xff), 2.0f, 35, 1.7f, 1.12f, 2, 1.4f, 8},
+    {"HARD",   RGB(0xff,0x9a,0x2e), 3.0f, 25, 2.6f, 1.25f, 3, 1.9f, 12},
+    {"INSANE", RGB(0xff,0x3b,0x3b), 4.2f, 15, 4.0f, 1.40f, 5, 2.6f, 18},
 };
 static int diff = 0;
 #define D (&DIFFS[diff])
@@ -172,16 +177,17 @@ typedef struct { int k; i64 v; int hits; } Op;
 typedef struct {
     int type, dead;
     float x, z;
-    i64 n, hp, max, reward;
+    i64 n, hp, max, reward, dmg;
     Op ops[2]; int used;
-    int hold, dir, planted, swing;
+    int hold, dir, planted, swing, flash, cool, slam;
 } Obj;
+typedef struct { float x, w; int t, tt, flash; } Zone;
 typedef struct { float x, z, pz; i64 d; int dead; } Bullet;
 typedef struct { float x, y, z, vx, vy, vz; int t; u16 col; } Fx;
 typedef struct { float x, y, z; int t; u16 col; char txt[20]; } Text;
 
 enum { M_TITLE, M_PLAY, M_OVER };
-static struct {
+typedef struct {
     int mode, t, overT, shake, bossAlive, newBest, saved;
     float px, dist, v, fireAcc, nextSpawn, lastBoss, nextBoss;
     i64 n, kills;
@@ -189,9 +195,18 @@ static struct {
     Bullet bullets[MAX_BULLETS]; int nbullets;
     Fx fx[MAX_FX]; int nfx;
     Text texts[MAX_TEXTS]; int ntexts;
-} S;
+    Zone zones[MAX_ZONES]; int nzones;
+} State;
+static State S;
 static int best[4];
 
+/* soldiers of an enemy group that are drawn: shrinks as you shoot it, even for huge groups */
+static int shown(const Obj *o) {
+    if (o->n <= 0) return 0;
+    if (o->max <= CG_DRAWN) return (int)o->n;
+    i64 k = ((i64)CG_DRAWN * o->n + o->max - 1) / o->max;
+    return (int)(k < 1 ? 1 : (k > CG_DRAWN ? CG_DRAWN : k));
+}
 static float radius(i64 n) { return RAD[n < 0 ? 0 : (n > MAX_DRAWN ? MAX_DRAWN : n)] * FS; }
 static int level(void) { return (int)(S.dist / 2000.0f); }
 
@@ -223,6 +238,55 @@ static int saveBest(void) {
     int m = (int)(S.dist / 10.0f);
     if (m > best[diff]) { best[diff] = m; writeBest(); return 1; }
     return 0;
+}
+
+/* ---------------------------------------------------------------- run save (main memory)
+ * A run is saved whenever a menu/pause screen opens, so leaving to the
+ * calculator's main menu (which may close the add-in) never loses it. */
+#define SAVE_MAGIC 0x53523032u
+/* Compact record: magic, difficulty, State scalars (everything before objs),
+ * three counts, then only the live objects/bullets/zones. A mid-run save is a
+ * couple of KB instead of the whole ~9 KB State, which keeps main-memory writes fast. */
+#define SAVE_HEAD ((int)offsetof(State, objs))
+#define SAVE_FIXED (8 + SAVE_HEAD + 12)
+static unsigned char SAVEBUF[sizeof(State) + 32];
+static unsigned char SAVE_ITEM2[] = "GAME";
+static int hasSave, saveDist;
+static unsigned char *putb(unsigned char *p, const void *src, int n) { memcpy(p, src, n); return p + n; }
+static void clearSave(void) { if (hasSave) MCSDelVar2(SAVE_DIR, SAVE_ITEM2); hasSave = 0; }
+static void loadSave(void) {
+    int len = 0;
+    hasSave = 0;
+    if (MCSGetDlen2(SAVE_DIR, SAVE_ITEM2, &len) == 0 && len >= SAVE_FIXED && len <= (int)sizeof(SAVEBUF)) {
+        u32 magic; int d, mode, no, nb, nz; float dist;
+        unsigned char *h = SAVEBUF + 8;
+        MCSGetData1(0, len, SAVEBUF);
+        memcpy(&magic, SAVEBUF, 4); memcpy(&d, SAVEBUF + 4, 4);
+        memcpy(&mode, h + offsetof(State, mode), 4); memcpy(&dist, h + offsetof(State, dist), 4);
+        memcpy(&no, h + SAVE_HEAD, 4); memcpy(&nb, h + SAVE_HEAD + 4, 4); memcpy(&nz, h + SAVE_HEAD + 8, 4);
+        if (magic == SAVE_MAGIC && mode == M_PLAY && d >= 0 && d < 4 &&
+            no >= 0 && no <= MAX_OBJS && nb >= 0 && nb <= MAX_BULLETS && nz >= 0 && nz <= MAX_ZONES &&
+            len == SAVE_FIXED + no * (int)sizeof(Obj) + nb * (int)sizeof(Bullet) + nz * (int)sizeof(Zone)) {
+            hasSave = 1; saveDist = (int)(dist / 10.0f);
+        }
+    }
+}
+static void saveGame(void) {
+    if (S.mode != M_PLAY) return;
+    int sh = S.shake; S.shake = 0;
+    unsigned char *p = SAVEBUF;
+    u32 magic = SAVE_MAGIC;
+    p = putb(p, &magic, 4); p = putb(p, &diff, 4);
+    p = putb(p, &S, SAVE_HEAD);
+    p = putb(p, &S.nobjs, 4); p = putb(p, &S.nbullets, 4); p = putb(p, &S.nzones, 4);
+    p = putb(p, S.objs, S.nobjs * (int)sizeof(Obj));
+    p = putb(p, S.bullets, S.nbullets * (int)sizeof(Bullet));
+    p = putb(p, S.zones, S.nzones * (int)sizeof(Zone));
+    S.shake = sh;
+    MCS_CreateDirectory(SAVE_DIR);
+    MCSDelVar2(SAVE_DIR, SAVE_ITEM2);
+    MCSPutVar2(SAVE_DIR, SAVE_ITEM2, (int)(p - SAVEBUF), SAVEBUF);
+    hasSave = 1; saveDist = (int)(S.dist / 10.0f);
 }
 
 /* ---------------------------------------------------------------- spawning */
@@ -268,20 +332,35 @@ static Op badOp(int lv) {
     o.v = rint_(1, 3);
     return o;
 }
+static i64 applyOp(const Op *op, i64 n);
+/* Gate pairs are built so the choice is a real one (the two results are close):
+ * both good (+12 vs x2: depends on squad size), a good gate vs the least-bad
+ * bad one, or - on harder modes - both bad (lesser evil). No straddling. */
 static void spawnGates(float z) {
-    int lv = level();
-    Op a = goodOp(lv), b = rint_(0, 99) < D->twoGood ? goodOp(lv) : badOp(lv);
+    int lv = level(), r = rint_(0, 99);
+    i64 ref = imax(6, S.n);
+    int lesser = r < diff * 8, goodPair = !lesser && r >= 100 - D->twoGood;
+    Op a = lesser ? badOp(lv) : goodOp(lv), b = a;
+    int found = 0; float bg = 1e30f;
+    for (int i = 0; i < 10; i++) {
+        Op c = lesser ? badOp(lv) : goodPair ? goodOp(lv) : badOp(lv);
+        if (c.k == a.k && c.v == a.v) continue;
+        i64 ra = applyOp(&a, ref), rc = applyOp(&c, ref);
+        float gap = (float)(rc > ra ? rc - ra : ra - rc) / (float)imax(1, ra);
+        if (gap < bg) { bg = gap; b = c; found = 1; }
+    }
+    if (!found) b = (lesser || !goodPair) ? badOp(lv) : goodOp(lv);
     if (rnd() & 1) { Op t = a; a = b; b = t; }
     Obj *o = newObj(T_GATE); if (!o) return;
     o->z = z; o->ops[0] = a; o->ops[1] = b;
 }
 static void spawnEnemies(float z) {
-    int lv = level(), groups = rint_(0, 2) == 0 ? 2 : 1;
+    int lv = level(), r = rint_(0, 5), groups = (r == 0 && lv >= 1) ? 3 : (r <= 2 ? 2 : 1);
     for (int i = 0; i < groups; i++) {
         float n = (rint_(3, 6) + lv * rint_(3, 6) + (float)S.n / rint_(3, 6)) * D->enemy;
         Obj *o = newObj(T_ENEMY); if (!o) return;
-        o->n = imin(MAX_N, (i64)(n + 0.5f));
-        o->x = groups == 2 ? (i ? 25.0f : -25.0f) : (float)rint_(-30, 30);
+        o->n = o->max = imin(MAX_N, (i64)(n + 0.5f));
+        o->x = groups == 3 ? (float)((i - 1) * 32) : groups == 2 ? (i ? 25.0f : -25.0f) : (float)rint_(-30, 30);
         o->z = z + i * 12;
     }
 }
@@ -291,19 +370,23 @@ static void spawnCrate(float z) {
     Obj *o = newObj(T_CRATE); if (!o) return;
     o->x = (float)rint_(-36, 36); o->z = z; o->hp = hp; o->reward = imax(3, hp / 3);
 }
+/* squad damage per second: keeps boss fights from being over in a blink */
+static float squadDps(i64 n) {
+    return fminf_(0.3f + (float)n * 0.045f, 4.0f) * 30.0f * (float)imax(1, n / 150);
+}
 static void spawnBoss(void) {
-    i64 hp = (i64)((120 + level() * 90 + (float)S.n * 0.4f) * D->boss + 0.5f);
+    i64 hp = (i64)((120 + level() * 90) * D->boss + squadDps(S.n) * (float)(6 + diff * 2) + 0.5f);
     Obj *o = newObj(T_BOSS); if (!o) return;
-    o->x = 0; o->z = FAR; o->hp = o->max = hp; o->dir = 1;
+    o->x = 0; o->z = FAR; o->hp = o->max = hp; o->dir = 1; o->cool = 50;
     S.bossAlive = 1;
     popText(0, 30, 150, "BOSS!", C_BAD);
 }
 static void spawnPattern(void) {
     int r = rint_(0, 99);
-    if (r < 38) { spawnGates(FAR); S.nextSpawn += 200; }
-    else if (r < 68) { spawnEnemies(FAR); S.nextSpawn += 170; }
-    else if (r < 82) { spawnCrate(FAR); S.nextSpawn += 140; }
-    else { spawnGates(FAR); spawnEnemies(FAR + 120); S.nextSpawn += 290; }
+    if (r < 32) { spawnGates(FAR); S.nextSpawn += 170; }
+    else if (r < 64) { spawnEnemies(FAR); S.nextSpawn += 140; }
+    else if (r < 78) { spawnCrate(FAR); S.nextSpawn += 120; }
+    else { spawnGates(FAR); spawnEnemies(FAR + 120); S.nextSpawn += 250; }
 }
 
 /* ---------------------------------------------------------------- gates */
@@ -332,7 +415,6 @@ static i64 applyOp(const Op *op, i64 n) {
     }
     return imax(0, imin(MAX_N, r));
 }
-static int straddling(void) { return fabsf_(S.px) < fmaxf_(2.5f, radius(S.n) * 0.55f); }
 
 static void newGame(int play) {
     saveBest();
@@ -340,16 +422,64 @@ static void newGame(int play) {
     S.t = S.overT = S.shake = S.bossAlive = S.newBest = S.saved = 0;
     S.px = 0; S.n = D->start; S.dist = 0; S.v = 1.6f; S.fireAcc = 0;
     S.nextSpawn = 120; S.lastBoss = 0; S.nextBoss = 3600; S.kills = 0;
-    S.nobjs = S.nbullets = S.nfx = S.ntexts = 0;
+    S.nobjs = S.nbullets = S.nfx = S.ntexts = S.nzones = 0;
     seed = (u32)RTC_GetTicks() * 2654435761u | 1u;
 }
 static void bossDown(Obj *o) {
     char buf[24];
+    S.nzones = 0;
     i64 bonus = 25 + level() * 25;
     o->dead = 1; S.bossAlive = 0; S.n += bonus; S.shake = 10;
     s_i64(s_cpy(buf, "BOSS DOWN +"), bonus);
     popText(o->x, 30, o->z, buf, C_GOLD);
     burst(o->x, 10, o->z, C_FOE, 30);
+}
+
+/* ---------------------------------------------------------------- boss attacks
+ * Telegraphed danger zones on the road: get out before they land. */
+static void addZone(float x, float w, int t) {
+    if (S.nzones >= MAX_ZONES) return;
+    Zone *z = &S.zones[S.nzones++];
+    z->x = x; z->w = w; z->t = z->tt = t; z->flash = 0;
+}
+static float zoneX(float x) { return fmaxf_(-ROAD + 12, fminf_(ROAD - 12, x)); }
+static void bossAttack(Obj *o, int p2) {
+    int tele = 38 - diff * 4 - (p2 ? 6 : 0);
+    if (tele < 16) tele = 16;
+    int kind = rint_(0, p2 ? 3 : 2);
+    if (kind == 0) addZone(zoneX(S.px), 13, tele);                            /* stomp where you stand */
+    else if (kind == 1) {                                                     /* sweep half the road */
+        int side = (rnd() & 1) ? 1 : -1;
+        addZone(side * 29.0f, 24, tele);
+        popText(0, 36, 60, side > 0 ? "<< LEFT!" : "RIGHT >>", C_BAD);
+    } else if (kind == 2) {                                                   /* one safe lane */
+        int safe = rint_(0, 2) - 1;
+        for (int l = -1; l <= 1; l++) if (l != safe) addZone(l * 30.0f, 14, tele);
+    } else { addZone(zoneX(S.px), 13, tele); addZone(zoneX(-S.px), 13, tele + 14); }   /* double stomp */
+    o->cool = tele + 36 + rint_(8, 20) - (p2 ? 14 : 0) + (kind == 3 ? 14 : 0);
+}
+static void updateZones(void) {
+    char buf[24];
+    for (int i = 0; i < S.nzones; i++) {
+        Zone *zn = &S.zones[i];
+        if (zn->flash > 0) zn->flash--;
+        if (zn->t > 0 && --zn->t == 0) {
+            zn->flash = 8; S.shake = 7;
+            for (int k = 0; k < S.nobjs; k++) if (S.objs[k].type == T_BOSS) S.objs[k].slam = 8;
+            if (fabsf_(S.px - zn->x) < zn->w + radius(S.n) * 0.5f) {
+                i64 d = imax(3, (i64)((float)S.n * (0.10f + 0.03f * diff) + 0.999f));
+                d = imin(d, S.n);
+                S.n -= d;
+                burst(S.px, 4, PZ + 4, C_ME, 10);
+                buf[0] = '-'; fmt(buf + 1, d);
+                popText(S.px, 16, PZ + 4, buf, C_BAD);
+            }
+            burst(zn->x, 3, PZ, C_CRATE, 8);
+        }
+    }
+    int j = 0;
+    for (int i = 0; i < S.nzones; i++) if (S.zones[i].t > 0 || S.zones[i].flash > 0) S.zones[j++] = S.zones[i];
+    S.nzones = j;
 }
 
 /* ---------------------------------------------------------------- update (30 Hz) */
@@ -393,18 +523,26 @@ static void update(int dir) {
         else if (o->type == T_ENEMY) {
             if (o->hold > 0) o->hold--;
             else {
-                o->z -= v + 1.0f;
+                o->z -= v + 1.3f;
                 if (o->z < 300) o->x += fsign(S.px - o->x) * fminf_(0.5f, fabsf_(S.px - o->x));
             }
             float er = radius(o->n);
             o->x = fmaxf_(-ROAD + er, fminf_(ROAD - er, o->x));
+            if (o->flash > 0) o->flash--;
+            if (o->dmg > 0 && S.t % 6 == 0) { buf[0] = '-'; fmt(buf + 1, o->dmg); popText(o->x, 22, o->z, buf, C_WHITE); o->dmg = 0; }
         } else if (o->type == T_BOSS) {
             if (!o->planted) {
                 o->z -= o->z > 180 ? 1.4f : 0.5f;
                 o->x += o->dir * 0.5f;
                 if (o->x < -25 || o->x > 25) o->dir = -o->dir;
-                if (o->z <= BOSS_STOP) { o->z = BOSS_STOP; o->planted = 1; S.shake = 8; }
-            } else o->x += fsign(S.px - o->x) * fminf_(0.8f, fabsf_(S.px - o->x));
+                if (o->z <= BOSS_STOP) { o->z = BOSS_STOP; o->planted = 1; S.shake = 8; popText(0, 36, 60, "DODGE THE RED!", C_BAD); }
+            } else {            /* strafes (so you must line up to shoot) and telegraphs attacks */
+                int p2 = o->hp < o->max / 2;
+                o->x += o->dir * (p2 ? 0.9f : 0.6f);
+                if (o->x < -28 || o->x > 28) o->dir = -o->dir;
+                if (o->slam > 0) o->slam--;
+                if (--o->cool <= 0) bossAttack(o, p2);
+            }
             o->swing++;
         }
     }
@@ -430,9 +568,15 @@ static void update(int dir) {
             if (fabsf_(b->x - o->x) >= hx || b->z < o->z - hz || b->pz > o->z + hz) continue;
             b->dead = 1;
             if (o->type == T_ENEMY) {
-                i64 k = imin(b->d, o->n); o->n -= k; S.kills += k;
-                burst(b->x, 3, o->z - hz, C_FOE, 2);
-                if (o->n <= 0) { o->dead = 1; burst(o->x, 3, o->z, C_FOE, 10); }
+                i64 k = imin(b->d, o->n); int before = shown(o);
+                o->n -= k; S.kills += k; o->flash = 3; o->dmg += k;
+                burst(b->x, 5, o->z - hz, C_SPARK, 2);
+                /* every soldier that visibly drops gets its own red burst, so you SEE the kills */
+                for (int q = shown(o); q < before; q++) {
+                    const signed char *f = FORM[q < 60 ? q : 59];
+                    burst(o->x + f[0] * FS, 5, o->z + f[1] * FS, C_FOE, 3);
+                }
+                if (o->n <= 0) { o->dead = 1; burst(o->x, 4, o->z, C_FOE, 8); popText(o->x, 18, o->z, "WIPED!", C_GOLD); }
             } else if (o->type == T_CRATE) {
                 if ((o->hp -= b->d) <= 0) {
                     o->dead = 1; S.n += o->reward;
@@ -456,12 +600,7 @@ static void update(int dir) {
             if (!o->used && o->z <= PZ) {
                 i64 before = S.n;
                 o->used = 1;
-                if (straddling()) {          /* both gates: adds first, then multipliers */
-                    const Op *a = &o->ops[0], *c = &o->ops[1];
-                    if (a->k > c->k) { const Op *t = a; a = c; c = t; }
-                    S.n = applyOp(c, applyOp(a, S.n));
-                    popText(S.px, 24, PZ, "BOTH!", C_AQUA);
-                } else S.n = applyOp(&o->ops[S.px < 0 ? 0 : 1], S.n);
+                S.n = applyOp(&o->ops[S.px < 0 ? 0 : 1], S.n);
                 buf[0] = S.n >= before ? '+' : '-';
                 fmt(buf + 1, S.n >= before ? S.n - before : before - S.n);
                 popText(S.px, 14, PZ, buf, S.n >= before ? C_GOLD : C_BAD);
@@ -485,19 +624,10 @@ static void update(int dir) {
                 popText(S.px, 14, PZ, buf, C_BAD); burst(o->x, 6, o->z, C_CRATE, 14);
             }
             if (o->z < -30) o->dead = 1;
-        } else if (o->type == T_BOSS) {
-            if (o->planted && o->swing % 8 == 0) {
-                i64 d = imin(S.n, imax(2, (i64)((float)S.n * 0.018f * D->boss) + 1));
-                i64 back = imin(o->hp, d);
-                S.n -= d; o->hp -= back; S.shake = 5;
-                burst(S.px, 4, PZ + 4, C_ME, 4);
-                buf[0] = '-'; fmt(buf + 1, d);
-                popText(S.px, 12, PZ + 4, buf, C_BAD);
-                if (o->hp <= 0) bossDown(o);
-            }
         }
     }
     { int j = 0; for (int i = 0; i < S.nobjs; i++) if (!S.objs[i].dead) S.objs[j++] = S.objs[i]; S.nobjs = j; }
+    updateZones();
 
     { int j = 0;
       for (int i = 0; i < S.nfx; i++) {
@@ -694,12 +824,12 @@ static void drawWorld(void) {
 }
 
 /* ---- soldiers: a handful of rectangles each ---- */
-static void soldier(float x, float z, int mine, int frame) {
+static void soldier(float x, float z, int mine, int frame, int flash) {
     float s0 = sc(z);
     int h = iround(5 * s0);
     if (h < 2) return;
     int X = iround(sx(x, s0)), Y = iround(sy(0, s0));
-    u16 col = mine ? C_ME : C_FOE, dark = mine ? C_MEDARK : C_FOEDARK;
+    u16 col = flash ? C_WHITE : mine ? C_ME : C_FOE, dark = mine ? C_MEDARK : C_FOEDARK;
     if (h < 5) { rect(X - 1, Y - h, X + 1, Y, col); return; }
     int bw = iround(h * 0.42f); if (bw < 2) bw = 2;
     int hw = iround(h * 0.32f); if (hw < 2) hw = 2;
@@ -715,15 +845,27 @@ static void soldier(float x, float z, int mine, int frame) {
     if (h >= 8) rect(X - hw / 2 + 1, hy - hw + 1, X - hw / 2 + 2, hy - hw + 2, mine ? C_MELIGHT : C_WHITE);
     if (mine) rect(br - 1, hy - 1, br + 1, Y - lh - 1, C_GUN);
 }
-static void group(float x, float z, i64 n, int mine) {
-    int k = (int)imin(n, CG_DRAWN);
+static void group(float x, float z, i64 n, int mine, int k, int flash) {
+    if (k < 0) k = (int)imin(n, CG_DRAWN);
     for (int j = 0; j < 60; j++) {
         int i = FORM_ORDER[j];
         if (i >= k) continue;
-        soldier(x + FORM[i][0] * FS, z + FORM[i][1] * FS, mine, (S.t >> 2) + i);
+        soldier(x + FORM[i][0] * FS, z + FORM[i][1] * FS, mine, (S.t >> 2) + i, flash);
     }
 }
 
+static void zoneQuad(float x0, float x1, u16 c) { quad(x0, 0, 34, x1, 0, 34, x1, 0, -12, x0, 0, -12, c); }
+static void drawZones(void) {
+    for (int i = 0; i < S.nzones; i++) {
+        const Zone *zn = &S.zones[i];
+        float x0 = fmaxf_(-ROAD, zn->x - zn->w), x1 = fminf_(ROAD, zn->x + zn->w);
+        float p = zn->t > 0 ? 1.0f - (float)zn->t / (float)zn->tt : 1.0f;
+        if (zn->t <= 0) { if (zn->flash > 3) zoneQuad(x0, x1, C_WHITE); continue; }
+        zoneQuad(x0, x1, ((S.t >> (p > 0.7f ? 1 : 2)) & 1) ? C_BAD : C_HURT);
+        zoneQuad(x0, x0 + 1.4f, C_BADEDGE);
+        zoneQuad(x1 - 1.4f, x1, C_BADEDGE);
+    }
+}
 static void drawGate(Obj *o) {
     char buf[24];
     float s = sc(o->z);
@@ -741,8 +883,7 @@ static void drawGate(Obj *o) {
         opLabel(op, buf);
         text(buf, (X0 + X1) / 2, (Y0 + Y1) / 2, ts, C_WHITE, 0, 1);
     }
-    if (!o->used && S.mode == M_PLAY && straddling())
-        rectf(sx(-1.5f, s), sy(17, s), sx(1.5f, s), sy(0, s), C_AQUA);
+    rectf(sx(0, s) - s, sy(16, s), sx(0, s) + s, sy(0, s), C_POST);   /* centre divider: pick a side */
 }
 static void drawCrate(Obj *o) {
     char buf[24];
@@ -782,6 +923,16 @@ static void rpoly(const float *p, int n, u16 c) {    /* rotated around the club 
     }
     poly(q, n, c);
 }
+/* club angle: raised while a strike is telegraphed, smashes down on impact */
+static float bossAng(const Obj *o) {
+    if (!o->planted) return -0.5f;
+    float wind = 0;
+    for (int i = 0; i < S.nzones; i++)
+        if (S.zones[i].t > 0) { float w = 1.0f - (float)S.zones[i].t / (float)S.zones[i].tt; if (w > wind) wind = w; }
+    if (wind > 0) return -0.5f - wind * 2.1f;
+    if (o->slam > 0) return -2.6f + (1.0f - o->slam / 8.0f) * 3.4f;
+    return -0.5f;
+}
 static void drawBoss(Obj *o) {
     char buf[24];
     bU = sc(o->z); bX = sx(o->x, bU); bY = sy(0, bU);
@@ -804,8 +955,7 @@ static void drawBoss(Obj *o) {
     { float p[] = {3.5f, 25.8f, 0.8f, 25, 0.8f, 24.2f, 3.5f, 24.8f}; bpoly(p, 4, C_EYE); }
     bbox(-2.2f, 22.8f, 2.2f, 23.6f, C_BLACK);
     /* club arm */
-    float smash = o->planted ? (o->swing % 8) / 8.0f : 0;
-    float ang = o->planted ? (smash < 0.5f ? -2.6f + smash * 1.2f : -2.0f + (smash - 0.5f) * 4.4f) : -0.5f;
+    float ang = bossAng(o);
     rCa = fcos(ang + PI_F / 2); rSa = fsin(ang + PI_F / 2);
     rShx = bX + 11.5f * bU; rShy = bY - 20 * bU;
     { float p[] = {-2, 0, 2, 0, 2, 9, -2, 9}; rpoly(p, 4, C_FOEDARK); }
@@ -842,21 +992,32 @@ static void panel(void) {
     rect(bx0 - 2, by0 - 2, bx1 + 2, by1 + 2, C_PANELEDGE);
     rect(bx0, by0, bx1, by1, C_PANEL);
 }
+static int menuSel;          /* title screen: 0 = CONTINUE (when a save exists) / NEW GAME, 1 = NEW GAME */
 static void drawOverlay(int paused) {
     char buf[40];
     if (S.mode == M_PLAY && !paused) return;
     panel();
     if (S.mode == M_TITLE) {
         text("SQUAD RUSH", W / 2, 54, 4, C_GOLD, 0, 1);
-        text("GROW YOUR SQUAD - BLAST THE HORDE", W / 2, 78, 1, C_WHITE, 0, 1);
-        for (int i = 0; i < 12; i++) rect(W / 2 - 50 + i * 9, 94, W / 2 - 46 + i * 9, 104, i % 2 ? C_ME : C_MEDARK);
+        text("GROW YOUR SQUAD - BLAST THE HORDE", W / 2, 76, 1, C_WHITE, 0, 1);
+        for (int i = 0; i < 12; i++) rect(W / 2 - 50 + i * 9, 88, W / 2 - 46 + i * 9, 98, i % 2 ? C_ME : C_MEDARK);
         s_cpy(s_cpy(s_cpy(buf, "< "), D->name), " >");
-        text(buf, W / 2, 124, 2, D->col, 0, 1);
-        text("LEFT/RIGHT: DIFFICULTY", W / 2, 146, 1, C_WHITE, 0, 1);
-        if ((S.t >> 4) & 1) text("EXE: START", W / 2, 158, 1, C_GOLD, 0, 1);
+        text(buf, W / 2, 114, 2, D->col, 0, 1);
+        int y = 136;
+        if (hasSave) {
+            char *p = s_cpy(buf, "CONTINUE ");
+            s_cpy(s_i64(p, saveDist), "M");
+            text(buf, W / 2, y, 1, menuSel == 0 ? C_GOLD : C_GREY, 0, 1);
+            if (menuSel == 0) { text(">", W / 2 - 52, y, 1, C_GOLD, 0, 1); text("<", W / 2 + 52, y, 1, C_GOLD, 0, 1); }
+            y += 12;
+        }
+        int ns = hasSave ? 1 : 0;
+        text("NEW GAME", W / 2, y, 1, menuSel == ns ? C_GOLD : C_GREY, 0, 1);
+        if (menuSel == ns) { text(">", W / 2 - 34, y, 1, C_GOLD, 0, 1); text("<", W / 2 + 34, y, 1, C_GOLD, 0, 1); }
+        text("UP/DOWN: PICK   LEFT/RIGHT: LEVEL", W / 2, 164, 1, C_WHITE, 0, 1);
+        text("EXE: OK   MENU: CALCULATOR MENU", W / 2, 175, 1, C_WHITE, 0, 1);
         s_cpy(s_i64(s_cpy(buf, "BEST "), best[diff]), "M");
-        text(buf, W / 2, 176, 1, C_GREY, 0, 1);
-        text("MENU: QUIT", W / 2, 186, 1, C_GREY, 0, 1);
+        text(buf, W / 2, 186, 1, C_GREY, 0, 1);
     } else if (S.mode == M_OVER) {
         text("SQUAD WIPED OUT", W / 2, 60, 3, C_BAD, 0, 1);
         char *p = s_cpy(s_i64(buf, (i64)(S.dist / 10)), "M   ");
@@ -865,13 +1026,15 @@ static void drawOverlay(int paused) {
         if (S.newBest) text("NEW BEST!", W / 2, 116, 2, C_GOLD, 0, 1);
         s_cpy(s_i64(s_cpy(buf, "BEST "), best[diff]), "M");
         text(buf, W / 2, 138, 1, C_GREY, 0, 1);
-        if ((S.t >> 4) & 1) text("EXE: RETRY", W / 2, 160, 1, C_WHITE, 0, 1);
-        text("EXIT: TITLE", W / 2, 172, 1, C_GREY, 0, 1);
+        text("EXE: RETRY", W / 2, 158, 1, C_WHITE, 0, 1);
+        text("EXIT: TITLE", W / 2, 170, 1, C_WHITE, 0, 1);
+        text("MENU: CALCULATOR MENU", W / 2, 182, 1, C_GREY, 0, 1);
     } else {
         text("PAUSED", W / 2, 70, 3, C_WHITE, 0, 1);
         text("EXE: RESUME", W / 2, 104, 1, C_WHITE, 0, 1);
-        text("EXIT: QUIT TO TITLE", W / 2, 118, 1, C_WHITE, 0, 1);
+        text("EXIT: SAVE AND GO TO TITLE", W / 2, 118, 1, C_WHITE, 0, 1);
         text("MENU: CALCULATOR MENU", W / 2, 132, 1, C_GREY, 0, 1);
+        text("(YOUR RUN IS SAVED - USE CONTINUE)", W / 2, 150, 1, C_GREY, 0, 1);
     }
 }
 
@@ -884,6 +1047,7 @@ static void draw(int paused) {
     if (S.shake && !paused) { shakeX = (int)(rnd() % 3) - 1; shakeY = (int)(rnd() % 3) - 1; }
     else shakeX = shakeY = 0;
     drawWorld();
+    drawZones();
 
     for (int i = 0; i < S.nobjs; i++) order[n++] = &S.objs[i];
     if (S.mode != M_TITLE && S.n > 0) { playerItem.type = T_PLAYER; playerItem.z = PZ; order[n++] = &playerItem; }
@@ -897,7 +1061,7 @@ static void draw(int paused) {
         Obj *o = order[i];
         switch (o->type) {
         case T_ENEMY: {
-            group(o->x, o->z, o->n, 0);
+            group(o->x, o->z, o->n, 0, shown(o), o->flash > 0);
             float s = sc(o->z);
             fmt(buf, o->n);
             pill(sx(o->x, s), sy(12, s) - radius(o->n) * s * 0.4f, buf, txtScale(s), C_PILLFOE);
@@ -905,19 +1069,20 @@ static void draw(int paused) {
         case T_GATE: drawGate(o); break;
         case T_CRATE: drawCrate(o); break;
         case T_BOSS: drawBoss(o); break;
-        case T_PLAYER: group(S.px, PZ, S.n, 1); break;
+        case T_PLAYER: group(S.px, PZ, S.n, 1, -1, 0); break;
         case T_BULLETS:
             for (int k = 0; k < S.nbullets; k++) {
                 Bullet *b = &S.bullets[k];
-                float s0 = sc(b->z), s1 = sc(b->z + 7), X = sx(b->x, s0);
-                rectf(X, sy(3.5f, s1), X + 1, sy(3.5f, s0) + 1, C_BULLET);
+                float s0 = sc(b->z), s1 = sc(b->z + 12), X = sx(b->x, s0);
+                rectf(X - 1, sy(3.5f, s1), X + 1, sy(3.5f, s0) + 1, C_BULLET);
+                rectf(X - 1, sy(3.5f, s0) - 1, X + 1, sy(3.5f, s0) + 1, C_WHITE);
             }
             break;
         }
     }
     for (int i = 0; i < S.nfx; i++) {
         Fx *p = &S.fx[i]; float s0 = sc(p->z), X = sx(p->x, s0), Y = sy(p->y, s0);
-        rectf(X, Y, X + 2, Y + 2, p->col);
+        rectf(X, Y, X + 3, Y + 3, p->col);
     }
     shakeX = shakeY = 0;
     if (S.mode != M_TITLE && S.n > 0) {
@@ -947,27 +1112,79 @@ static int keyBit(const u16 *st, int code) {
 }
 static int keyDown(int code) { return keyBit(keyNow, code); }
 static int keyPressed(int code) { return keyBit(keyNow, code) && !keyBit(keyPrev, code); }
-static int anyKeyDown(void) { for (int i = 0; i < 8; i++) if (keyNow[i]) return 1; return 0; }
+static int anyKeyDown(void) { for (int i = 0; i < 5; i++) if (keyNow[i]) return 1; return 0; }   /* 10 rows x 8 cols = 5 words */
 
-/* Blocking OS GetKey loop for the pause screen: lets MENU work natively. */
-/* The OS may restore its status bar after visiting the main menu. */
+/* Menus (title, pause, game over) are blocking OS GetKey loops: the OS then
+ * handles MENU natively, so the calculator's main menu always works. The run
+ * is saved before any of them opens, and every screen is redrawn after GetKey
+ * returns (the OS may have shown the main menu or its status bar meanwhile). */
 static void screenSetup(void) {
     Bdisp_EnableColor(1);
     EnableStatusArea(3);           /* hide the status bar: full 384x216 */
     vram = (u16 *)GetVRAMAddress();
 }
-static int pauseScreen(void) {     /* returns 1 = resume, 0 = quit to title */
+static void flushKeys(void) {      /* wait briefly for keys to be released; never block forever */
+    int t0 = RTC_GetTicks(), dt, guard = 0;
+    do {
+        keyUpdate();
+        dt = RTC_GetTicks() - t0; if (dt < 0) dt = 64;
+    } while (anyKeyDown() && dt < 64 && ++guard < 20000);   /* time cap AND iteration cap */
+    keyUpdate();
+}
+static int pauseScreen(void) {     /* returns 1 = resume, 0 = save and go to title */
     int key;
-    draw(1);
-    Bdisp_PutDisp_DD();
+    saveGame();
+    flushKeys();
     for (;;) {
+        draw(1); Bdisp_PutDisp_DD();
         GetKey(&key);
         screenSetup();
         if (key == KEY_CTRL_EXE) return 1;
         if (key == KEY_CTRL_EXIT) return 0;
-        /* after returning from the main menu the screen must be redrawn */
-        draw(1); Bdisp_PutDisp_DD();
     }
+}
+static int titleScreen(void) {     /* returns 1 = continue saved run, 0 = new game */
+    int key;
+    loadSave();
+    menuSel = 0;
+    draw(0); Bdisp_PutDisp_DD();   /* first frame goes up before anything that could wait */
+    flushKeys();
+    for (;;) {
+        draw(0); Bdisp_PutDisp_DD();
+        GetKey(&key);
+        screenSetup();
+        int items = hasSave ? 2 : 1;
+        if (key == KEY_CTRL_UP) menuSel = (menuSel + items - 1) % items;
+        else if (key == KEY_CTRL_DOWN) menuSel = (menuSel + 1) % items;
+        else if (key == KEY_CTRL_LEFT) { diff = (diff + 3) % 4; if (!hasSave) menuSel = 0; }
+        else if (key == KEY_CTRL_RIGHT) { diff = (diff + 1) % 4; if (!hasSave) menuSel = 0; }
+        else if (key == KEY_CTRL_EXE) return hasSave && menuSel == 0;
+    }
+}
+static int overScreen(void) {      /* returns 1 = retry, 0 = title */
+    int key;
+    flushKeys();
+    for (;;) {
+        draw(0); Bdisp_PutDisp_DD();
+        GetKey(&key);
+        screenSetup();
+        if (key == KEY_CTRL_EXE) return 1;
+        if (key == KEY_CTRL_EXIT) return 0;
+    }
+}
+static void continueGame(void) {          /* unpack the record validated by loadSave() */
+    unsigned char *p = SAVEBUF + 4;
+    int no, nb, nz;
+    memcpy(&diff, p, 4); p += 4;
+    memset(&S, 0, sizeof(S));
+    memcpy(&S, p, SAVE_HEAD); p += SAVE_HEAD;
+    memcpy(&no, p, 4); memcpy(&nb, p + 4, 4); memcpy(&nz, p + 8, 4); p += 12;
+    memcpy(S.objs, p, no * sizeof(Obj)); p += no * sizeof(Obj);
+    memcpy(S.bullets, p, nb * sizeof(Bullet)); p += nb * sizeof(Bullet);
+    memcpy(S.zones, p, nz * sizeof(Zone));
+    S.nobjs = no; S.nbullets = nb; S.nzones = nz;
+    S.mode = M_PLAY; S.saved = 0; S.shake = 0;
+    seed = (u32)RTC_GetTicks() * 2654435761u | 1u;
 }
 
 /* ================================================================ main */
@@ -984,42 +1201,36 @@ int main(void) {
     newGame(0);
 
     int last = RTC_GetTicks(), acc = 0;
-    keyUpdate(); keyUpdate();
     for (;;) {
+        if (S.mode == M_TITLE) {
+            if (titleScreen()) continueGame();
+            else { clearSave(); newGame(1); }
+            last = RTC_GetTicks(); acc = 0;
+            flushKeys();
+            continue;
+        }
+        if (S.mode == M_OVER) {
+            clearSave();
+            if (overScreen()) newGame(1); else newGame(0);
+            last = RTC_GetTicks(); acc = 0;
+            flushKeys();
+            continue;
+        }
         int now = RTC_GetTicks(), dt = now - last;
         last = now;
         if (dt < 0 || dt > 32) dt = 4;     /* midnight wrap / returned from menu */
         acc += dt * 30;                     /* RTC is 128 Hz; logic runs at 30 Hz */
         int steps = 0;
-        while (acc >= 128 && steps < 3) {
+        while (acc >= 128 && steps < 3 && S.mode == M_PLAY) {
             keyUpdate();
-            if (S.mode == M_TITLE) {
-                if (keyPressed(KEY_PRGM_LEFT) || keyPressed(KEY_PRGM_UP)) diff = (diff + 3) % 4;
-                if (keyPressed(KEY_PRGM_RIGHT) || keyPressed(KEY_PRGM_DOWN)) diff = (diff + 1) % 4;
-                if (keyPressed(KEY_PRGM_EXE)) newGame(1);
-                if (keyPressed(KEY_PRGM_MENU)) {
-                    /* hand control to the OS: MENU goes to the main menu */
-                    int key;
-                    do GetKey(&key); while (key != KEY_CTRL_EXE && key != KEY_CTRL_EXIT);
-                    screenSetup();
-                    last = RTC_GetTicks(); acc = 0;
-                    keyUpdate(); keyUpdate();
-                }
-            } else if (S.mode == M_OVER) {
-                if (S.overT > 20 && keyPressed(KEY_PRGM_EXE)) newGame(1);
-                if (S.overT > 20 && keyPressed(KEY_PRGM_EXIT)) newGame(0);
-            } else {
-                if (keyPressed(KEY_PRGM_EXIT) || keyPressed(KEY_PRGM_OPTN) ||
-                    keyPressed(KEY_PRGM_F1) || keyPressed(KEY_PRGM_MENU)) {
-                    if (!pauseScreen()) newGame(0);
-                    while (anyKeyDown()) keyUpdate();
-                    keyUpdate();
-                    last = RTC_GetTicks(); acc = 0;
-                    break;
-                }
+            if (keyPressed(KEY_PRGM_EXIT) || keyPressed(KEY_PRGM_OPTN) ||
+                keyPressed(KEY_PRGM_F1) || keyPressed(KEY_PRGM_MENU)) {
+                if (!pauseScreen()) newGame(0);
+                flushKeys();
+                last = RTC_GetTicks(); acc = 0;
+                break;
             }
-            int dir = 0;
-            if (S.mode == M_PLAY) dir = keyDown(KEY_PRGM_RIGHT) - keyDown(KEY_PRGM_LEFT);
+            int dir = keyDown(KEY_PRGM_RIGHT) - keyDown(KEY_PRGM_LEFT);
             update(dir);
             acc -= 128; steps++;
         }

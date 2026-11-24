@@ -5,7 +5,13 @@
 .SUFFIXES:
 
 ifeq ($(strip $(FXCGSDK)),)
+ifeq ($(OS),Windows_NT)
 export FXCGSDK := C:/Users/salvador/PrizmSDK/PrizmSDK-win-0.6
+else
+# macOS / Linux: the SDK built by tools/setup-toolchain.sh (override with FXCGSDK=...)
+export FXCGSDK := $(HOME)/prizm-toolchain/libfxcg
+export PATH := $(HOME)/prizm-toolchain/prefix/bin:$(PATH)
+endif
 endif
 
 include $(FXCGSDK)/toolchain/prizm_rules
@@ -18,7 +24,7 @@ INCLUDES	:=
 
 MKG3AFLAGS := -n basic:SquadRush -i uns:../icon-uns.bmp -i sel:../icon-sel.bmp
 
-CFLAGS	= -O2 -Wall $(MACHDEP) $(INCLUDE) -ffunction-sections -fdata-sections
+CFLAGS	= -O2 -fno-strict-aliasing -Wall $(MACHDEP) $(INCLUDE) -ffunction-sections -fdata-sections
 CXXFLAGS	=	$(CFLAGS) -fno-exceptions
 LDFLAGS	= $(MACHDEP) -T$(FXCGSDK)/toolchain/prizm.x -Wl,-static -Wl,-gc-sections
 LIBS	:=	 -lc -lfxcg -lgcc
